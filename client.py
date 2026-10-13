@@ -50,6 +50,12 @@ def receiver_loop(sock):
 
                 print(f"\n[USER LEFT] {username}")
 
+            elif header.type == MessageType.MSG_DELIVER:
+                sender = payload.get("from", "Unknown")
+                message = payload.get("message", "")
+
+                print(f"\n[DELIVER] {sender}: {message}")
+
             else:
                 print(
                     f"\n[SERVER EVENT] Type={header.type}, "
@@ -106,6 +112,19 @@ def send_request(sock, msg_type, payload, timeout = 10):
         with pending_lock:
             pending_requests.pop(req_id, None)
 
+def show_peer_list():
+    with peers_lock:
+        peer_list = sorted(peers)
+
+    if not peer_list:
+        print("No other users are currently connected.")
+        return
+
+    print(f"Connected peers ({len(peer_list)}):")
+
+    for index, username in enumerate(peer_list, start=1):
+        print(f"  {index}. {username}")
+
 def start_client():
     client_socket = socket.socket(
         socket.AF_INET,
@@ -129,7 +148,7 @@ def start_client():
 
         if (
             header.type != MessageType.WELCOME
-            or header.req_id != next_req_id
+            or header.req_id != 1
         ):
             print(f"Handshake failed: {payload}")
             return
@@ -140,6 +159,13 @@ def start_client():
         print(f"My username: {payload['username']}")
         print(f"Current peers: {payload['peers']}")
 
+        with peers_lock:
+            peers.clear()
+            peers.update(
+                peer["username"]
+                for peer in payload["peers"]
+            )
+
         receiver_thread = threading.Thread(
             target=receiver_loop,
             args=(client_socket,),
@@ -149,13 +175,38 @@ def start_client():
 
         # Step 2: Exchange multiple messages.
         while True:
-            command = input("\nEnter 'ping' to test or 'quit' to disconnect: ").strip().lower()
+            command = input("\nEnter 'ping', 'peers', 'broadcast', 'direct' or 'quit': ").strip().lower()
 
             if command == "ping":
                 send_request(
                     client_socket,
                     MessageType.PING,
                     {"message": "Ping from client"},
+                )
+
+            elif command == "peers":
+                show_peer_list()
+
+            elif command == "broadcast":
+                message = input("Broadcast message: ").strip()
+
+                send_request(
+                    client_socket,
+                    MessageType.MSG_BROADCAST,
+                    {"message": message},
+                )
+
+            elif command == "direct":
+                recipient = input("Recipient username: ").strip()
+                message = input("Direct message: ").strip()
+
+                send_request(
+                    client_socket,
+                    MessageType.MSG_DIRECT,
+                    {
+                        "to": recipient,
+                        "message": message,
+                    },
                 )
 
             elif command == "quit":

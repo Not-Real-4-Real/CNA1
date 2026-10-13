@@ -89,6 +89,74 @@ def get_connected_users():
     with clients_lock:
         return list(clients.keys())
 
+def broadcast_message(sender, message):
+    with clients_lock:
+        recipients = [client for client in clients.values() if client is not sender]
+
+    successful_sends = 0
+
+    for recipient in recipients:
+        try:
+            send_to_client(
+                recipient,
+                MessageType.MSG_DELIVER,
+                req_id=0,
+                payload={
+                    "from": sender.username,
+                    "message": message,
+                },
+            )
+            successful_sends += 1
+
+        except (OSError, ConnectionError, ValueError) as error:
+            print(
+                f"[BROADCAST ERROR] Could not send to "
+                f"{recipient.username}: {error}"
+            )    
+
+    print(
+        f"[BROADCAST] {sender.username} -> "
+        f"{successful_sends}/{len(recipients)} recipients"
+    )
+
+    return successful_sends
+
+def direct_message(sender, receiver_username, message):
+    with clients_lock:
+        recipient = clients.get(receiver_username)
+
+    if recipient is None:
+        return False, {
+            "code": 404,
+            "message": f"User '{receiver_username}' is not connected",
+        }
+    
+    try:
+        send_to_client(
+            recipient,
+            MessageType.MSG_DELIVER,
+            req_id=0,
+            payload={
+                "from": sender.username,
+                "message": message,
+            },
+        )
+
+    except (OSError, ConnectionError, ValueError) as error:
+        print(
+            f"[DIRECT ERROR] Could not send to "
+            f"{receiver_username}: {error}"
+        ) 
+        return False, {
+            "code": 503,
+            "message": f"Could not deliver message to '{receiver_username}'",
+        }   
+
+    print(
+        f"[DIRECT] {sender.username} -> {receiver_username}"
+    )
+    return True, None
+
 def send_to_client(client, msg_type, req_id, payload, flags=0):
     "Send one complete frame safely to a client."
     with client.send_lock:
@@ -98,7 +166,7 @@ def send_to_client(client, msg_type, req_id, payload, flags=0):
             req_id,
             payload,
             flags=flags,
-        )
+        ) 
 
 def handle_client(client_socket, client_address):
     "Thread to handle 1 client"
@@ -180,6 +248,88 @@ def handle_client(client_socket, client_address):
                         MessageType.PONG,
                         header.req_id,
                         {"message": "Pong from server"},
+                    )
+
+                elif header.type == MessageType.MSG_BROADCAST:
+                    message = payload.get("message")
+
+                    if not isinstance(message, str) or not message.strip():
+                        send_to_client(
+                            client,
+                            MessageType.ERROR,
+                            header.req_id,
+                            {
+                                "code": 400,
+                                "message": "Broadcast message must be a non-empty string",
+                            },
+                        )
+                        continue
+
+                    recipient_count = broadcast_message(client, message)
+
+                    send_to_client(
+                        client,
+                        MessageType.MSG_SENT,
+                        header.req_id,
+                        {
+                            "message": "Broadcast accepted",
+                            "recipients": recipient_count,
+                        },
+                    )
+
+                elif header.type == MessageType.MSG_DIRECT:
+                    receiver = payload.get("to")
+                    message = payload.get("message")
+
+                    if (not isinstance(receiver, str) or not receiver.strip()):
+                        send_to_client(
+                            client,
+                            MessageType.ERROR,
+                            header.req_id,
+                            {
+                                "code": 400,
+                                "message": "A recipient username is required",
+                            },
+                        )
+                        continue
+
+                    if (not isinstance(message, str) or not message.strip()):
+                        send_to_client(
+                            client,
+                            MessageType.ERROR,
+                            header.req_id,
+                            {
+                                "code": 400,
+                                "message": "Direct message must be a non-empty string",
+                            },
+                        )
+                        continue
+
+                    receiver = receiver.strip()
+
+                    success, error_payload = direct_message(
+                        client,
+                        receiver,
+                        message,
+                    )
+
+                    if not success:
+                        send_to_client(
+                            client,
+                            MessageType.ERROR,
+                            header.req_id,
+                            error_payload,
+                        )
+                        continue
+
+                    send_to_client(
+                        client,
+                        MessageType.MSG_SENT,
+                        header.req_id,
+                        {
+                            "message": "Direct message accepted",
+                            "recipient": receiver,
+                        },
                     )
 
                 elif header.type == MessageType.LOGOUT:
