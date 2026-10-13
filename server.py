@@ -1,48 +1,166 @@
 import socket
 import threading
 
+from client_connection import ClientConnection
 from protocol import MessageType, send_frame, recv_frame
 
 HOST = "127.0.0.1"
 PORT = 5000
 
+# Shared registry: username -> client connection.
+clients = {}
+
+# Protects registry operations.
 clients_lock = threading.Lock()
-active_client = 0
 
+# Serialize join and leave so peer list stays consistent
+membership_lock = threading.Lock()
 
-def handle_client(client_socket, client_address):
-    "Thread to handle 1 client"
+next_username_id = 1
 
+def register_client(client):
+    "Assign a temporary username and register the client."
     global next_username_id
 
     with clients_lock:
-        active_clients += 1
-        client_count = active_clients
+        username = f"user_{next_username_id}"
+        next_username_id += 1
+
+        client.username = username
+        clients[username] = client
+        active_count = len(clients)
+
+        peers = [
+            {"username": name}
+            for name in clients if name != username
+        ]
+
+        existing_clients = [
+            peer for name, peer in clients.items() if name != username
+        ]
 
     print(
-        f"[CONNECTED] {client_address} | "
-        f"Active clients: {client_count}"
+        f"[REGISTERED] {username} | "
+        f"{client.address} | Active clients: {active_count}"
     )
 
-    try:  
-        with client_socket:
-            # Step 1: Perform the initial handshake.
-            header, payload = recv_frame(client_socket)
-        
-            print(f"Received type: {header.type}")
-            print(f"Request ID: {header.req_id}")
-            print(f"Payload length: {header.length}")
-            print(f"Payload: {payload}")
-        
-            # Send the application-level acknowledgement.
-            send_frame(
-                client_socket,
-                MessageType.WELCOME,
-                header.req_id,
-                {"message": "Connection established"}
-            )
-        
-            print(f"[HANDSHAKE] {client_address} completed")
+    return username, peers, existing_clients
+
+def unregister_client(client):
+    "Remove a client from the registry if registered."
+    if client.username is None:
+        return
+
+    with membership_lock:
+        with clients_lock:
+            username = client.username
+            if clients.get(username) is not client:
+                client.username = None
+                return
+
+            del clients[username]
+
+            remaining_clients = list(clients.values())
+            active_count = len(clients)
+
+        for peer in remaining_clients:
+            try:
+                send_to_client(
+                    peer,
+                    MessageType.USER_LEAVE,
+                    req_id = 0,
+                    payload={"username": username}
+                )
+            except (OSError, ConnectionError, ValueError) as error:
+                print(
+                    f"[NOTIFY ERROR] Could not notify "
+                    f"{peer.username} about {username} leaving: {error}"
+                )
+
+        client.username = None
+
+    print(
+        f"[UNREGISTERED] {client.username} | "
+        f"{client.address} | Active clients: {active_count}"
+    )
+
+def get_connected_users():
+    "Return a snapshot of currently registered usernames."
+    with clients_lock:
+        return list(clients.keys())
+
+def send_to_client(client, msg_type, req_id, payload, flags=0):
+    "Send one complete frame safely to a client."
+    with client.send_lock:
+        send_frame(
+            client.sock,
+            msg_type,
+            req_id,
+            payload,
+            flags=flags,
+        )
+
+def handle_client(client_socket, client_address):
+    "Thread to handle 1 client"
+    client = ClientConnection(sock=client_socket, address=client_address)
+
+    print(f"[TCP CONNECTED] {client_address}")
+
+    try:
+        # Timeout for testing connection timeout.
+        # client.sock.settimeout(10.0)
+
+        with client.sock:
+            # 1. Receive and validate the handshake.
+            header, payload = recv_frame(client.sock)
+
+            if header.type != MessageType.HELLO:
+                send_to_client(
+                    client,
+                    MessageType.ERROR,
+                    header.req_id,
+                    {
+                        "code": 400,
+                        "message": "Expected HELLO",
+                    },
+                )
+                return
+
+            # 2. Register only after receiving a valid HELLO.
+            with membership_lock:
+                username, peers, existing_clients = register_client(client)
+
+                # 3. Complete the handshake and identify the client.
+                send_to_client(
+                    client,
+                    MessageType.WELCOME,
+                    header.req_id,
+                    {
+                        "message": "Connection established",
+                        "username": username,
+                        "peers": peers,
+                    },
+                )
+
+                print(
+                    f"[HANDSHAKE] {username} completed | "
+                    f"Peers: {[p['username'] for p in peers]}"
+                )
+
+                for peer in existing_clients:
+                    try:
+                        send_to_client(
+                            peer,
+                            MessageType.USER_JOIN,
+                            req_id=0,
+                            payload={"username": username},
+                        )
+                    except (OSError, ConnectionError, ValueError) as error:
+                        print(
+                            f"[NOTIFY ERROR] Could not notify "
+                            f"{peer.username} about {username} joining: "
+                            f"{error}"
+                        )
 
             # Step 2: Keep the connection alive.
             while True:
@@ -86,15 +204,7 @@ def handle_client(client_socket, client_address):
         print(f"[CONNECTION ERROR] {client_address}: {error}")
 
     finally:
-        with clients_lock:
-            active_clients -= 1
-            client_count = active_clients
-
-        print(
-            f"[DISCONNECTED] {client_address} | "
-            f"Active clients: {client_count}"
-        )  
-
+        unregister_client(client)
 
 def start_server():
     # 1. Create a TCP socket using IPv4.
