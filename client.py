@@ -9,7 +9,7 @@ pending_requests = {}
 pending_lock = threading.Lock()
 
 # Request IDs must be unique among outstanding requests.
-next_req_id = 2
+next_req_id = 3
 req_id_lock = threading.Lock()
 
 # Shared state for peer membership.
@@ -153,18 +153,42 @@ def start_client():
             print(f"Handshake failed: {payload}")
             return
 
-        print(f"Received type: {header.type}")
-        print(f"Payload length: {header.length}")
-        print(f"Server: {payload['message']}")
-        print(f"My username: {payload['username']}")
-        print(f"Current peers: {payload['peers']}")
+        print(f"[WELCOME] {payload.get('message')}")
+
+        # Step 2: Authenticate before starting the receiver thread.
+        username = input("Username: ").strip()
+        password = input("Password: ")
+
+        send_frame(
+            client_socket,
+            MessageType.AUTH,
+            req_id=2,
+            payload={
+                "username": username,
+                "password": password,
+            },
+        )
+
+        auth_header, auth_payload = recv_frame(client_socket)
+
+        if auth_header is None or auth_header.type != MessageType.AUTH_OK or auth_header.req_id != 2:
+            print(
+                "Authentication failed: "
+                f"{auth_payload.get('message', auth_payload)}"
+            )
+            return
+
+        my_username = auth_payload["username"]
+        print(f"[AUTHENTICATED] Logged in as {my_username}")
 
         with peers_lock:
             peers.clear()
             peers.update(
                 peer["username"]
-                for peer in payload["peers"]
+                for peer in auth_payload["peers"]
             )
+
+        print(f"Current peers: {sorted(peers)}")
 
         receiver_thread = threading.Thread(
             target=receiver_loop,
@@ -226,7 +250,7 @@ def start_client():
                     break
 
             else:
-                print("Unknown command. Enter 'ping' or 'quit'.")
+                print("Unknown command.")
 
     except (OSError, ConnectionError, ValueError) as error:
         print(f"Client error: {error}")

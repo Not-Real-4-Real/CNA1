@@ -7,6 +7,12 @@ from protocol import MessageType, send_frame, recv_frame
 HOST = "127.0.0.1"
 PORT = 5000
 
+ACCOUNTS = {
+    "alice": "alice123",
+    "bob": "bob123",
+    "charlie": "charlie123",
+}
+
 # Shared registry: username -> client connection.
 clients = {}
 
@@ -16,19 +22,15 @@ clients_lock = threading.Lock()
 # Serialize join and leave so peer list stays consistent
 membership_lock = threading.Lock()
 
-next_username_id = 1
-
-def register_client(client):
-    "Assign a temporary username and register the client."
-    global next_username_id
+def register_client(client, username):
+    "Register the client."
 
     with clients_lock:
-        username = f"user_{next_username_id}"
-        next_username_id += 1
+        if username in clients:
+            return False, [], []
 
         client.username = username
         clients[username] = client
-        active_count = len(clients)
 
         peers = [
             {"username": name}
@@ -39,12 +41,7 @@ def register_client(client):
             peer for name, peer in clients.items() if name != username
         ]
 
-    print(
-        f"[REGISTERED] {username} | "
-        f"{client.address} | Active clients: {active_count}"
-    )
-
-    return username, peers, existing_clients
+    return True, peers, existing_clients
 
 def unregister_client(client):
     "Remove a client from the registry if registered."
@@ -180,13 +177,13 @@ def handle_client(client_socket, client_address):
 
         with client.sock:
             # 1. Receive and validate the handshake.
-            header, payload = recv_frame(client.sock)
+            hello_header, hello_payload = recv_frame(client.sock)
 
-            if header.type != MessageType.HELLO:
+            if hello_header.type != MessageType.HELLO:
                 send_to_client(
                     client,
                     MessageType.ERROR,
-                    header.req_id,
+                    hello_header.req_id,
                     {
                         "code": 400,
                         "message": "Expected HELLO",
@@ -194,25 +191,79 @@ def handle_client(client_socket, client_address):
                 )
                 return
 
-            # 2. Register only after receiving a valid HELLO.
-            with membership_lock:
-                username, peers, existing_clients = register_client(client)
+            # 2. Complete the handshake.
+            send_to_client(
+                client,
+                MessageType.WELCOME,
+                hello_header.req_id,
+                {
+                    "message": "Connection established",
 
-                # 3. Complete the handshake and identify the client.
+                },
+            )
+
+            print(f"[HELLO] TCP session established: {client.address}")
+
+            auth_header, auth_payload = recv_frame(client.sock)
+
+            if auth_header.type != MessageType.AUTH:
                 send_to_client(
                     client,
-                    MessageType.WELCOME,
-                    header.req_id,
+                    MessageType.ERROR,
+                    auth_header.req_id,
                     {
-                        "message": "Connection established",
-                        "username": username,
-                        "peers": peers,
+                        "code": 401,
+                        "message": "Authentication required"
                     },
                 )
+                return
 
-                print(
-                    f"[HANDSHAKE] {username} completed | "
-                    f"Peers: {[p['username'] for p in peers]}"
+            username = auth_payload.get("username")
+            password = auth_payload.get("password")
+
+            if (
+                not isinstance(username, str)
+                or not username
+                or not isinstance(password, str)
+                or not password
+                or ACCOUNTS.get(username) != password
+            ):
+                send_to_client(
+                    client,
+                    MessageType.ERROR,
+                    auth_header.req_id,
+                    {
+                        "code": 401,
+                        "message": "Invalid username or password"
+                    },
+                )
+                return
+
+            # 2. Register only after receiving a valid AUTH.
+            with membership_lock:
+                registered, peers, existing_clients = register_client(client, username)
+
+                if not registered:
+                    send_to_client(
+                        client,
+                        MessageType.ERROR,
+                        auth_header.req_id,
+                        {
+                            "code": 409,
+                            "message": "Account already connected"
+                        },
+                    )
+                    return
+
+                send_to_client(
+                    client,
+                    MessageType.AUTH_OK,
+                    auth_header.req_id,
+                    {
+                        "username": username,
+                        "message": "Authentication successful",
+                        "peers": peers,
+                    },
                 )
 
                 for peer in existing_clients:
@@ -229,6 +280,11 @@ def handle_client(client_socket, client_address):
                             f"{peer.username} about {username} joining: "
                             f"{error}"
                         )
+
+            print(
+                f"[AUTH OK] {username} | {client.address} | "
+                f"Active clients: {len(clients)}"
+            )
 
             # Step 2: Keep the connection alive.
             while True:
