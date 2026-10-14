@@ -5,7 +5,7 @@ import time
 from udp_protocol import *
 
 SERVER_HOST = "127.0.0.1"
-SERVER_PORT = 5000
+SERVER_PORT = 5001
 
 SERVER_ADDRESS = (SERVER_HOST, SERVER_PORT)
 
