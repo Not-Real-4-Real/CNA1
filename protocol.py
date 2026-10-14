@@ -33,7 +33,7 @@ class MessageType:
 
 # Header flags
 FLAG_NONE = 0
-FLAG_ENCRYTED = 1 << 0  # 0b00000001
+FLAG_ENCRYPTED = 1 << 0  # 0b00000001
 
 @dataclass
 class Header:

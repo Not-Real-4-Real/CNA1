@@ -259,6 +259,5 @@ def start_client():
         client_socket.close()
         print("Client socket closed.")
 
-
 if __name__ == "__main__":
     start_client()

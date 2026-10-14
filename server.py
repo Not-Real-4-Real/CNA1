@@ -11,6 +11,7 @@ ACCOUNTS = {
     "alice": "alice123",
     "bob": "bob123",
     "charlie": "charlie123",
+    "doug": "doug123",
 }
 
 # Shared registry: username -> client connection.
