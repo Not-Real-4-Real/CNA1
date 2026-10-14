@@ -2,7 +2,6 @@ import json
 import struct
 from dataclasses import dataclass
 
-
 RDT_HEADER_FORMAT = "!16sIIBB"
 RDT_HEADER_SIZE = struct.calcsize(RDT_HEADER_FORMAT)  # 26 bytes
 
@@ -47,7 +46,6 @@ class MessageType:
     PING = 14
     PONG = 15
     LOGOUT = 16
-
 
 # Application header flags
 FLAG_NONE = 0

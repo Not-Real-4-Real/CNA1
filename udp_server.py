@@ -1,3 +1,4 @@
+import time
 import socket
 from dataclasses import dataclass
 
@@ -7,11 +8,23 @@ HOST = "127.0.0.1"
 PORT = 5000
 BUFFER_SIZE = 1201
 
+RETRANSMISSION_TIMEOUT = 1.0  # seconds
+MAX_RETRANSMISSIONS = 5
+
 @dataclass
 class Session:
     address: tuple
     session_id: bytes
-    next_seq_num: int = 1
+
+    # Outgoing DATA state
+    send_seq_num: int = 0
+    pending_seq_num: int | None = None
+    pending_data: bytes | None = None
+    pending_since: float | None = None
+    retransmissions: int = 0
+
+    # Incoming DATA state
+    expected_recv_seq: int = 0
 
 # Key: (client address, session ID)
 sessions: dict[tuple, Session] = {}
@@ -32,34 +45,64 @@ def send_control(
     packet = encode_datagram(rdt)
     sock.sendto(packet, address)
 
+def send_ack(
+    sock: socket.socket,
+    address: tuple,
+    session_id: bytes,
+    ack_num: int,
+):
+    packet = encode_datagram(
+        rdt=RDTHeader(
+            session_id=session_id,
+            ack_num=ack_num,
+            type=RDTType.ACK,
+        )
+    )
+
+    sock.sendto(packet, address)
+
+    print(
+        f"[ACK SENT] {address} | ack_num={ack_num}"
+    )
+
 def send_pong(
     sock: socket.socket,
     session: Session,
     req_id: int,
     payload: dict,
 ) -> None:
+    if session.pending_data is not None:
+        print(f"[SEND BLOCKED] Session {session.session_id.hex()} already has DATA awaiting ACK")
+        return
+    
     rdt = RDTHeader(
         session_id=session.session_id,
-        seq_num=session.next_seq_num,
+        seq_num=session.send_seq_num,
         type=RDTType.DATA,
     )
 
     packet = encode_datagram(
         rdt=rdt,
         app=AppHeader(length=0, type=MessageType.PONG, req_id=req_id,),
-        payload={"message": "Pong from server"},
+        payload={
+            "message": "Pong from server",
+            "echo": payload.get("message"),
+        },
     )
+
+    session.pending_data = packet
+    session.pending_seq_num = session.send_seq_num
+    session.pending_since = time.monotonic()
+    session.retransmissions = 0
 
     sock.sendto(packet, session.address)
 
     print(
         f"[PONG SENT] {session.address} "
-        f"| session={session.session_id.hex()[:8]} "
-        f"| seq={session.next_seq_num} "
-        f"| req_id={req_id}"
+        f"| seq={session.send_seq_num} "
+        f"| req_id={req_id} "
+        f"| awaiting ACK"
     )
-
-    session.next_seq_num += 1
 
 def handle_open(
     sock: socket.socket,
@@ -138,39 +181,179 @@ def handle_data(
         print(f"[REJECTED DATA] Missing application data from {address}")
         return
 
-    app_type = datagram.app.type
-    req_id = datagram.app.req_id
-    payload = datagram.payload
+    seq_num = datagram.rdt.seq_num
 
-    if app_type == MessageType.PING:
+    # This implementation uses alternating sequence numbers: 0 and 1.
+    if seq_num not in (0, 1):
         print(
-            f"[PING RECEIVED] {address} "
-            f"| seq={datagram.rdt.seq_num} "
+            f"[REJECTED DATA] Invalid sequence number "
+            f"{seq_num} from {address}"
+        )
+        return
+
+    if seq_num == session.expected_recv_seq:
+        # ACK the packet before processing its application content.
+        send_ack(
+            sock,
+            address,
+            session.session_id,
+            ack_num=seq_num,
+        )
+
+        # Advance receive state only once.
+        session.expected_recv_seq ^= 1
+
+        app_type = datagram.app.type
+        req_id = datagram.app.req_id
+        payload = datagram.payload
+
+        print(
+            f"[DATA ACCEPTED] {address} "
+            f"| seq={seq_num} "
             f"| req_id={req_id} "
             f"| payload={payload}"
         )
 
-        send_pong(
-            sock=sock,
-            session=session,
-            req_id=req_id,
-            payload=payload,
-        )
+        if app_type == MessageType.PING:
+            print(
+                f"[PING RECEIVED] {address} "
+                f"| seq={datagram.rdt.seq_num} "
+                f"| req_id={req_id} "
+                f"| payload={payload}"
+            )
 
-    else:
+            send_pong(
+                sock=sock,
+                session=session,
+                req_id=req_id,
+                payload=payload,
+            )
+
+        else:
+            print(
+                f"[UNSUPPORTED APP TYPE] {app_type} from {address}"
+            )
+
+        return
+
+    # Case 2: The packet has the previous sequence number.
+    # With alternating bits, it is a duplicate of the last accepted DATA.
+    print(
+        f"[DUPLICATE DATA] {address} "
+        f"| seq={seq_num} "
+        f"| resending ACK"
+    )
+
+    send_ack(
+        sock,
+        address,
+        session.session_id,
+        ack_num=seq_num,
+    )
+
+def handle_ack(
+    address: tuple,
+    datagram: Datagram,       
+):
+    "Process an ACK for the server's DATA packet."
+
+    key = (address, datagram.rdt.session_id)
+    session = sessions.get(key)
+
+    if session is None:
+        print(f"[REJECTED ACK] Unknown session from {address}")
+        return
+
+    ack_num = datagram.rdt.ack_num
+
+    if session.send_seq_num is None:
         print(
-            f"[UNSUPPORTED APP TYPE] {app_type} from {address}"
+            f"[UNEXPECTED ACK] {address} "
+            f"| ack_num={ack_num} "
+            "| no outstanding DATA"
+        )
+        return
+
+    # A stale or unrelated ACK must not clear the pending packet.
+    if ack_num != session.pending_seq_num:
+        print(
+            f"[IGNORED ACK] {address} "
+            f"| ack_num={ack_num} "
+            f"| expected={session.pending_seq_num}"
+        )
+        return
+
+    print(
+        f"[ACK ACCEPTED] {address} "
+        f"| ack_num={ack_num} "
+        f"| retries={session.retransmissions}"
+    )
+
+    session.pending_data = None
+    session.pending_seq_num = None
+    session.pending_since = None
+    session.retransmissions = 0
+
+    # Alternate 0 -> 1 -> 0 -> ...
+    session.send_seq_num ^= 1
+
+def check_retransmission_timeouts(
+    sock: socket.socket
+):
+    now = time.monotonic()
+
+    # Use a snapshot because failed sessions may be removed.
+    for key, session in list(sessions.items()):
+        if session.pending_data is None:
+            continue
+
+        if session.pending_since is None:
+            continue
+
+        elapsed = now - session.pending_since
+
+        if elapsed < RETRANSMISSION_TIMEOUT:
+            continue
+
+        # All retries sent with no matching ACK.
+        if session.retransmissions >= MAX_RETRANSMISSIONS:
+            print(
+                f"[TRANSMISSION FAILED] {session.address} "
+                f"| seq={session.pending_seq_num} "
+                f"| retries={session.retransmissions} "
+                "| invalidating session"
+            )
+
+            del sessions[key]
+            continue
+
+        sock.sendto(session.pending_data, session.address)
+
+        session.retransmissions += 1
+        session.pending_since = now
+
+        print(
+            f"[RETRANSMIT] {session.address} "
+            f"| seq={session.pending_seq_num} "
+            f"| retry={session.retransmissions}/"
+            f"{MAX_RETRANSMISSIONS}"
         )
 
 def run_server():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((HOST, PORT))
+    sock.settimeout(0.1)
 
     print(f"UDP server listening on {HOST}:{PORT}")
 
     try:
         while True:
-            data, address = sock.recvfrom(BUFFER_SIZE)
+            try:
+                data, address = sock.recvfrom(BUFFER_SIZE)
+
+            except socket.timeout:
+                check_retransmission_timeouts(sock)
+                continue
 
             print(
                 f"\n[DATAGRAM RECEIVED] {address} "
@@ -195,17 +378,18 @@ def run_server():
                 handle_data(sock, address, datagram)
 
             elif rdt.type == RDTType.ACK:
-                print(
-                    f"[ACK RECEIVED] {address} "
-                    f"| ack_num={rdt.ack_num} "
-                    "(reliability not implemented yet)"
-                )
+                handle_ack(address, datagram)
 
             else:
                 print(f"[UNEXPECTED DATAGRAM]")
 
+            check_retransmission_timeouts(sock)
+
     except KeyboardInterrupt:
         print("\nServer shutting down.")
+
+    finally:
+        sock.close()
 
 if __name__ == "__main__":
     run_server()
