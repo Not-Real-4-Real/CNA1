@@ -133,28 +133,30 @@ def handle_ack(datagram) -> None:
 def handle_data(datagram) -> None:
     "ACK incoming DATA, drop duplicates, pass new messages upward."
     global expected_recv_seq
- 
+
     seq = datagram.rdt.seq_num
- 
+
     if seq not in (0, 1):
         print(f"[REJECTED DATA] Invalid seq={seq}")
         return
- 
+
     # Always ACK, even duplicates, in case our previous ACK was lost.
     send_ack(seq)
- 
+
     if seq != expected_recv_seq:
         print(f"[DUPLICATE DATA] seq={seq}")
         return
- 
+
     expected_recv_seq ^= 1
- 
+
     if datagram.app is None:
         print("[REJECTED DATA] Missing application header")
         return
- 
+
     if message_handler is not None:
         message_handler(datagram)
+    else:
+        print("[ERROR] message_handler is None")
 
 def handle_datagram(datagram) -> None:
     packet_type = datagram.rdt.type
@@ -182,7 +184,7 @@ def receiver_loop() -> None:
                 running.clear()
             break
  
-        if datagram is not None:
+        if datagram is not None:          
             handle_datagram(datagram)
  
 receiver_thread = threading.Thread(target=receiver_loop, daemon=True)
@@ -254,23 +256,62 @@ def close_session() -> bool:
     return ok
 
 # Layer 4: Requests (req_id <-> response matching)
+def show_peer_list() -> None:
+    with peers_lock:
+        peer_snapshot = sorted(peers)
+
+    print("\n========== ONLINE PEERS ==========")
+
+    if not peer_snapshot:
+        print("No other peers are currently online.")
+    else:
+        for index, username in enumerate(peer_snapshot, start=1):
+            print(f"{index}. {username}")
+
+    print("==================================")
+
 def handle_server_event(datagram) -> None:
-    "One-way, server-initiated messages (req_id 0). Nothing is waiting on them."
+    "Handle one-way server events (req_id 0)."    
     msg_type = datagram.app.type
     payload = datagram.payload
 
-    if msg_type == MessageType.USER_JOIN:
+    if msg_type == MessageType.USER_LIST:
+        users = payload.get("users", [])
+
+        if not isinstance(users, list) or not all(
+            isinstance(username, str) for username in users
+        ):
+            print("[INVALID USER_LIST] Malformed peer list")
+            return
+
+        with peers_lock:
+            peers.clear()
+            peers.update(users)
+
+        print(f"\n[PEER LIST UPDATED] {len(users)} peer(s)")
+
+    elif msg_type == MessageType.USER_JOIN:
         username = payload["username"]
         with peers_lock:
             peers.add(username)
         print(f"\n[USER JOINED] {username}")
+
     elif msg_type == MessageType.USER_LEAVE:
         username = payload["username"]
         with peers_lock:
             peers.discard(username)
         print(f"\n[USER LEFT] {username}")
+
+    elif msg_type == MessageType.MSG_DELIVER:
+        sender = payload.get("from", "Unknown")
+        message = payload.get("message", "")
+        print(f"\n[DELIVER] {sender}: {message}")
+
     else:
-        print(f"\n[SERVER EVENT] type={msg_type} | payload={payload}")
+        print(
+            f"\n[SERVER EVENT] type={msg_type} "
+            f"| payload={payload}"
+        )
 
 def deliver_response(datagram) -> None:
     "Called by layer 2 for each new DATA message; routes it by req_id."
@@ -341,7 +382,38 @@ def ping(message: str) -> bool:
         f"| payload={response.payload}"
     )
     return True
- 
+
+def broadcast(message: str) -> bool:
+    message = message.strip()
+
+    if not message:
+        print("[ERROR] Broadcast message cannot be empty")
+        return False
+
+    response = send_request(
+        MessageType.MSG_BROADCAST,
+        {"message": message},
+    )
+
+    if response is None:
+        print("[BROADCAST FAILED] No application response")
+        return False
+
+    if response.app.type == MessageType.ERROR:
+        print(f"[BROADCAST ERROR] {response.payload}")
+        return False
+
+    if response.app.type != MessageType.MSG_SENT:
+        print(
+            f"[UNEXPECTED RESPONSE] "
+            f"type={response.app.type} "
+            f"| payload={response.payload}"
+        )
+        return False
+
+    print(f"[BROADCAST ACCEPTED] {response.payload}")
+    return True
+
 def run() -> None:
     receiver_thread.start()
  
@@ -350,16 +422,29 @@ def run() -> None:
             return
  
         while True:
-            message = input(
-                "\nEnter a message to ping (or 'quit' to disconnect): "
-            ).strip()
- 
-            if message.lower() == "quit":
+            command = input(
+                "\nCommands: 'peers', 'ping', 'broadcast', 'quit': "
+            ).strip().lower()
+
+            if command == "quit":
                 break
-            if not message:
-                continue
- 
-            ping(message)
+
+            elif command == "peers":
+                show_peer_list()
+
+            elif command == "ping":
+                message = input("Ping message: ").strip()
+                if message:
+                    ping(message)
+                else:
+                    print("[ERROR] Ping message cannot be empty")
+
+            elif command == "broadcast":
+                message = input("Broadcast message: ").strip()
+                broadcast(message)
+
+            else:
+                print("Unknown command.")
  
     except KeyboardInterrupt:
         print("\n[INTERRUPTED]")

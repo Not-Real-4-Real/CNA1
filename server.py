@@ -93,6 +93,13 @@ def send_reliable(session: Session, msg_type: int, req_id: int, payload: dict) -
     session.sender.outbox.append((msg_type, req_id, payload))
     pump_outbox(session)
 
+    print(
+        f"[OUTBOX QUEUE] recipient={session.address} "
+        f"| type={msg_type} | req_id={req_id} "
+        f"| in_flight={session.sender.in_flight_seq} "
+        f"| queued={len(session.sender.outbox)}"
+    )
+
 def pump_outbox(session: Session) -> None:
     "If the channel is idle, transmit the next queued message."
     sender = session.sender
@@ -372,6 +379,19 @@ def get_connected_users() -> list[str]:
 
 def on_session_opened(session: Session) -> None:
     username = register_client(session)
+
+    current_peers = [
+        peer for peer in get_connected_users()
+        if peer != username
+    ]
+
+    send_reliable(
+        session,
+        MessageType.USER_LIST,
+        EVENT_REQ_ID,
+        {"users": current_peers},
+    )
+
     notify_users(MessageType.USER_JOIN, {"username": username}, exclude=session)
 
 def on_session_closed(session: Session, reason: str) -> None:
@@ -400,9 +420,87 @@ def handle_ping(session: Session, datagram: Datagram) -> None:
         },
     )
 
+def handle_broadcast(session: Session, datagram: Datagram) -> None:
+    """Handle a client broadcast request."""
+    req_id = datagram.app.req_id
+    payload = datagram.payload
+    message = payload.get("message")
+
+    # 1. Validate the message.
+    if not isinstance(message, str) or not message.strip():
+        send_reliable(
+            session,
+            MessageType.ERROR,
+            req_id,
+            {
+                "code": 400,
+                "message": "Broadcast message must be a non-empty string",
+            },
+        )
+        return
+
+    message = message.strip()
+
+    # 2. Identify the sender.
+    sender_username = client_names.get(session_key(session))
+
+    if sender_username is None:
+        send_reliable(
+            session,
+            MessageType.ERROR,
+            req_id,
+            {
+                "code": 401,
+                "message": "Sender is not registered",
+            },
+        )
+        return
+
+    # 3. Snapshot recipients, excluding the sender.
+    recipients = [
+        (username, recipient_session)
+        for username, recipient_session in list(clients.items())
+        if recipient_session is not session
+    ]
+
+    # 4. Queue one reliable delivery per recipient.
+    delivery_payload = {
+        "from": sender_username,
+        "message": message,
+    }
+
+    for username, recipient_session in recipients:
+        send_reliable(
+            recipient_session,
+            MessageType.MSG_DELIVER,
+            EVENT_REQ_ID,
+            delivery_payload,
+        )
+
+        print(
+            f"[BROADCAST QUEUED] {sender_username} -> {username}"
+        )
+
+    # 5. Acknowledge application-level acceptance to the sender.
+    send_reliable(
+        session,
+        MessageType.MSG_SENT,
+        req_id,
+        {
+            "message": "Broadcast accepted",
+            "recipients": len(recipients),
+        },
+    )
+
+    print(
+        f"[BROADCAST] sender={sender_username} "
+        f"| recipients={len(recipients)}"
+    )
+
 # Add new message types here (broadcast, direct, file transfer, ...).
 MESSAGE_HANDLERS = {
     MessageType.PING: handle_ping,
+    MessageType.MSG_BROADCAST: handle_broadcast,
 }
 
 def dispatch_message(session: Session, datagram: Datagram) -> None:
@@ -437,6 +535,12 @@ def run_server() -> None:
         while True:
             try:
                 received = transport_receive()
+
+            except ConnectionResetError as error:
+                # Windows may report ICMP Port Unreachable through recvfrom().
+                print(f"[UDP RESET IGNORED] {error}")
+                continue
+
             except socket.timeout:
                 tick()
                 continue
