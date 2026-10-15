@@ -15,7 +15,7 @@ MAX_RETRANSMISSIONS = 5
 
 RESPONSE_TIMEOUT = RETRANSMISSION_TIMEOUT * (MAX_RETRANSMISSIONS + 3)
 
-HEARTBEAT_INTERVAL = 2.0
+HEARTBEAT_INTERVAL = 10.0
 
 session_id = secrets.token_bytes(16)
  
@@ -47,6 +47,9 @@ pending_requests = {}             # req_id -> Queue for that response
 pending_lock = threading.Lock()
 next_req_id = 1
 req_id_lock = threading.Lock()
+EVENT_REQ_ID = 0                  # one-way server events carry req_id 0
+peers = set()                     # usernames of other connected users
+peers_lock = threading.Lock()
 
 # Layer 1: Transport
 def transport_send(packet: bytes) -> None:
@@ -184,7 +187,7 @@ def receiver_loop() -> None:
  
 receiver_thread = threading.Thread(target=receiver_loop, daemon=True)
 
-# Layer 3: Session (OPEN / CLOSE handshakes)
+# Layer 3: Session (OPEN / CLOSE handshakes, heartbeat)
 def control_handshake(packet_type: int, ack_event_: threading.Event, label: str) -> bool:
     "Send a control packet, retransmitting until its ACK event is set."
     ack_event_.clear()
@@ -198,6 +201,31 @@ def control_handshake(packet_type: int, ack_event_: threading.Event, label: str)
         print(f"[TIMEOUT] No {label}_ACK ({attempt + 1}/{MAX_RETRANSMISSIONS + 1})")
  
     return False
+
+def heartbeat_loop() -> None:
+    """
+    Tell the server we are still alive. One-way and unacknowledged: a lost
+    heartbeat is covered by the next one, so nothing is retransmitted.
+    """
+    # wait() returns True once heartbeat_stop is set, which ends the loop.
+    while not heartbeat_stop.wait(HEARTBEAT_INTERVAL):
+        try:
+            send_control(RDTType.HEARTBEAT, quiet=True)
+        except OSError:
+            break
+
+def start_heartbeat() -> None:
+    global heartbeat_thread
+
+    heartbeat_stop.clear()
+    heartbeat_thread = threading.Thread(target=heartbeat_loop, daemon=True)
+    heartbeat_thread.start()
+
+def stop_heartbeat() -> None:
+    heartbeat_stop.set()
+
+    if heartbeat_thread is not None:
+        heartbeat_thread.join(timeout=1.0)
 
 def open_session() -> bool:
     global established
@@ -219,38 +247,39 @@ def close_session() -> bool:
         return False
  
     print("[CLOSING SESSION]")
-    stop_heartbeat()
+    stop_heartbeat()   # no heartbeat should trail after the CLOSE
     ok = control_handshake(RDTType.CLOSE, close_ack_event, "CLOSE")
     established = False
     print("[SESSION CLOSED]" if ok else "[SESSION CLOSE UNCONFIRMED]")
     return ok
 
-def heartbeat_loop() -> None:
-    "One-way and unacknowledged: a lost heartbeat is covered by the next one, so nothing is retransmitted."
-    # wait() returns True once heartbeat_stop is set, which ends the loop.
-    while not heartbeat_stop.wait(HEARTBEAT_INTERVAL):
-        try:
-            send_control(RDTType.HEARTBEAT, quiet=True)
-        except OSError:
-            break
-
-def start_heartbeat() -> None:
-    global heartbeat_thread
- 
-    heartbeat_stop.clear()
-    heartbeat_thread = threading.Thread(target=heartbeat_loop, daemon=True)
-    heartbeat_thread.start()
-
-def stop_heartbeat() -> None:
-    heartbeat_stop.set()
- 
-    if heartbeat_thread is not None:
-        heartbeat_thread.join(timeout=1.0)
-
 # Layer 4: Requests (req_id <-> response matching)
+def handle_server_event(datagram) -> None:
+    "One-way, server-initiated messages (req_id 0). Nothing is waiting on them."
+    msg_type = datagram.app.type
+    payload = datagram.payload
+
+    if msg_type == MessageType.USER_JOIN:
+        username = payload["username"]
+        with peers_lock:
+            peers.add(username)
+        print(f"\n[USER JOINED] {username}")
+    elif msg_type == MessageType.USER_LEAVE:
+        username = payload["username"]
+        with peers_lock:
+            peers.discard(username)
+        print(f"\n[USER LEFT] {username}")
+    else:
+        print(f"\n[SERVER EVENT] type={msg_type} | payload={payload}")
+
 def deliver_response(datagram) -> None:
     "Called by layer 2 for each new DATA message; routes it by req_id."
     req_id = datagram.app.req_id
+
+    # req_id 0 is a server event, not a response to any request of ours.
+    if req_id == EVENT_REQ_ID:
+        handle_server_event(datagram)
+        return
  
     with pending_lock:
         response_queue = pending_requests.get(req_id)

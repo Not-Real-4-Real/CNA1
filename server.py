@@ -11,7 +11,7 @@ BUFFER_SIZE = 1201
 
 RETRANSMISSION_TIMEOUT = 1.0   # seconds
 MAX_RETRANSMISSIONS = 5
-HEARTBEAT_TIMEOUT = 8.0        # seconds without valid client activity
+HEARTBEAT_TIMEOUT = 30.0        # seconds without valid client activity
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
