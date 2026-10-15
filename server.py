@@ -42,9 +42,11 @@ class Session:
 # Key: (client address, session ID)
 sessions: dict[tuple, Session] = {}
 
-# Upward hooks, wired up at the bottom of layers 3 and 4.
-message_handler = None
-failure_handler = None
+# Upward hooks. A lower layer calls them; a higher layer fills them in.
+message_handler = None           # layer 2 -> layer 4: new in-order DATA
+failure_handler = None           # layer 2 -> layer 3: retries exhausted
+session_opened_handler = None    # layer 3 -> layer 4: new session created
+session_closed_handler = None    # layer 3 -> layer 4: session removed (any reason)
 
 # Layer 1: Transport
 def transport_send(address: tuple, packet: bytes) -> None:
@@ -221,46 +223,59 @@ def check_retransmission(session: Session) -> None:
     )
 
 # Layer 3: Sessions
+def session_key(session: Session) -> tuple:
+    return (session.address, session.session_id)
+
 def handle_open(address: tuple, session_id: bytes) -> None:
     "Create a session, or repeat the response to a repeated OPEN."
     key = (address, session_id)
     session = sessions.get(key)
 
     if session is None:
-        sessions[key] = Session(address=address, session_id=session_id)
+        session = Session(address=address, session_id=session_id)
+        sessions[key] = session
         print(f"[SESSION OPENED] {address} | session={session_id.hex()}")
+
+        # Only a genuinely new session is announced upward, never a repeat.
+        if session_opened_handler is not None:
+            session_opened_handler(session)
     else:
         session.last_seen = time.monotonic()
         print(f"[OPEN REPEATED] {address} | session={session_id.hex()}")
 
     send_control(address, session_id, RDTType.OPEN_ACK)
 
-def handle_close(address: tuple, session_id: bytes) -> None:
-    key = (address, session_id)
+def remove_session(session: Session, reason: str) -> bool:
+    """The single exit point for every session.
+    Returns False if the session was already gone."""
+    if sessions.pop(session_key(session), None) is None:
+        return False
 
-    if sessions.pop(key, None) is None:
-        print(f"[CLOSE REPEATED] Unknown session from {address} | re-ACKing")
-    else:
-        print(
-            f"[SESSION CLOSED] {address} "
-            f"| session={session_id.hex()[:8]} "
-            f"| active sessions={len(sessions)}"
-        )
-
-    send_control(address, session_id, RDTType.CLOSE_ACK)
-
-def drop_session(session: Session, reason: str) -> None:
-    sessions.pop((session.address, session.session_id), None)
     print(
-        f"[SESSION DROPPED] {session.address} "
+        f"[SESSION REMOVED] {session.address} "
         f"| session={session.session_id.hex()[:8]} "
         f"| reason={reason} "
         f"| active sessions={len(sessions)}"
     )
 
+    if session_closed_handler is not None:
+        session_closed_handler(session, reason)
+
+    return True
+
+def handle_close(address: tuple, session_id: bytes) -> None:
+    session = sessions.get((address, session_id))
+
+    if session is None:
+        print(f"[CLOSE REPEATED] Unknown session from {address} | re-ACKing")
+    else:
+        remove_session(session, "closed by client")
+
+    send_control(address, session_id, RDTType.CLOSE_ACK)
+
 def on_transmission_failed(session: Session) -> None:
     "Layer 2 gave up on this client, so invalidate the session."
-    drop_session(session, "transmission failed")
+    remove_session(session, "transmission failed")
 
 failure_handler = on_transmission_failed
 
@@ -271,7 +286,7 @@ def check_session_timeouts() -> None:
     for session in list(sessions.values()):
         inactive_for = now - session.last_seen
         if inactive_for > HEARTBEAT_TIMEOUT:
-            drop_session(session, f"inactive {inactive_for:.1f}s")
+            remove_session(session, f"inactive {inactive_for:.1f}s")
 
 def check_retransmissions() -> None:
     for session in list(sessions.values()):
@@ -306,8 +321,69 @@ def dispatch_datagram(address: tuple, datagram: Datagram) -> None:
         handle_data(session, datagram)
     elif rdt.type == RDTType.ACK:
         handle_ack(session, datagram)
+    # RDTType.HEARTBEAT: refreshing last_seen above is all it needs.
 
 # Layer 4: Application
+
+# Client registry: who is online, by username. Layer 3 only knows sessions.
+# Usernames are an application idea, so they live here.
+clients: dict[str, Session] = {}     # username -> session
+client_names: dict[tuple, str] = {}  # session key -> username
+guest_counter = 0
+
+def register_client(session: Session) -> str:
+    "Assign a temporary username and store the connection."
+    global guest_counter
+
+    guest_counter += 1
+    username = f"Guest{guest_counter}"
+
+    clients[username] = session
+    client_names[session_key(session)] = username
+
+    print(f"[CLIENT REGISTERED] {username} | {session.address}")
+    print(f"[ONLINE] {get_connected_users()}")
+    return username
+
+def unregister_client(session: Session) -> str | None:
+    "Remove a connection. Returns its username, or None if it had none."
+    username = client_names.pop(session_key(session), None)
+
+    if username is None:
+        return None
+
+    clients.pop(username, None)
+
+    print(f"[CLIENT UNREGISTERED] {username} | {session.address}")
+    print(f"[ONLINE] {get_connected_users()}")
+    return username
+
+EVENT_REQ_ID = 0
+def notify_users(msg_type: int, payload: dict, exclude: Session | None = None) -> None:
+    "Send a one-way event to every registered client (optionally skipping one)."
+    for session in list(clients.values()):
+        if session is exclude:
+            continue
+        send_reliable(session, msg_type, EVENT_REQ_ID, payload)
+
+def get_connected_users() -> list[str]:
+    "Snapshot of registered usernames in join order. Safe to loop over."
+    return list(clients)
+
+def on_session_opened(session: Session) -> None:
+    username = register_client(session)
+    notify_users(MessageType.USER_JOIN, {"username": username}, exclude=session)
+
+def on_session_closed(session: Session, reason: str) -> None:
+    username = unregister_client(session)
+ 
+    # The leaver is already out of the registry, so only the others are told.
+    if username is not None:
+        notify_users(MessageType.USER_LEAVE, {"username": username})
+
+session_opened_handler = on_session_opened
+session_closed_handler = on_session_closed
+
 def handle_ping(session: Session, datagram: Datagram) -> None:
     req_id = datagram.app.req_id
     payload = datagram.payload
