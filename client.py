@@ -1,263 +1,350 @@
-import socket
 import queue
+import secrets
+import socket
 import threading
+ 
+from udp_protocol import *
 
-from protocol import MessageType, send_frame, recv_frame
+SERVER_HOST = "127.0.0.1"
+SERVER_PORT = 5000
+SERVER_ADDRESS = (SERVER_HOST, SERVER_PORT)
+ 
+BUFFER_SIZE = 1201
+RETRANSMISSION_TIMEOUT = 1.0
+MAX_RETRANSMISSIONS = 5
 
-# Request ID -> queue for the corresponding response.
-pending_requests = {}
-pending_lock = threading.Lock()
+RESPONSE_TIMEOUT = RETRANSMISSION_TIMEOUT * (MAX_RETRANSMISSIONS + 3)
 
-# Request IDs must be unique among outstanding requests.
-next_req_id = 3
-req_id_lock = threading.Lock()
+HEARTBEAT_INTERVAL = 2.0
 
-# Shared state for peer membership.
-peers = set()
-peers_lock = threading.Lock()
+session_id = secrets.token_bytes(16)
+ 
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.settimeout(0.1)
 
 running = threading.Event()
 running.set()
 
-HOST = "127.0.0.1"
-PORT = 5000
+# Layer 2 (reliable) state
+send_lock = threading.Lock()      # stop-and-wait: one unACKed DATA at a time
+send_seq = 0                      # seq of the next DATA we send
+pending_seq = None                # seq we are currently waiting an ACK for
+ack_event = threading.Event()     # set by receiver when the pending DATA is ACKed
+expected_recv_seq = 0             # seq we expect from the server next
+ 
+# Layer 2 -> Layer 4 hook: called with every new (non-duplicate) DATA datagram.
+message_handler = None
+ 
+# Layer 3 (session) state
+established = False
+open_ack_event = threading.Event()
+close_ack_event = threading.Event()
+heartbeat_stop = threading.Event()   # set to stop the heartbeat thread
+heartbeat_thread = None
+ 
+# Layer 4 (request) state
+pending_requests = {}             # req_id -> Queue for that response
+pending_lock = threading.Lock()
+next_req_id = 1
+req_id_lock = threading.Lock()
 
-def receiver_loop(sock):
+# Layer 1: Transport
+def transport_send(packet: bytes) -> None:
+    sock.sendto(packet, SERVER_ADDRESS)
+
+def transport_receive():
+    data, address = sock.recvfrom(BUFFER_SIZE)
+ 
+    if address != SERVER_ADDRESS:
+        print(f"[IGNORED] Unexpected sender: {address}")
+        return None
+ 
+    try:
+        datagram = decode_datagram(data)
+    except ValueError as error:
+        print(f"[INVALID DATAGRAM] {error}")
+        return None
+ 
+    if datagram.rdt.session_id != session_id:
+        print("[IGNORED] Session ID mismatch")
+        return None
+ 
+    return datagram
+
+# Layer 2: Reliable delivery (stop-and-wait, alternating 0/1 sequence)
+def send_control(packet_type: int, quiet: bool = False) -> None:
+    "Send a header-only packet (OPEN / CLOSE / HEARTBEAT)."
+    transport_send(
+        encode_datagram(RDTHeader(session_id=session_id, type=packet_type))
+    )
+    if not quiet:
+        print(f"[SENT CONTROL] type={packet_type} | session={session_id.hex()[:8]}")
+
+def send_ack(ack_num: int) -> None:
+    transport_send(
+        encode_datagram(
+            RDTHeader(session_id=session_id, ack_num=ack_num, type=RDTType.ACK)
+        )
+    )
+    print(f"[ACK SENT] ack_num={ack_num}")
+
+def send_reliable(msg_type: int, req_id: int, payload: dict) -> bool:
+    global send_seq, pending_seq
+ 
+    with send_lock:
+        seq = send_seq
+        packet = encode_datagram(
+            RDTHeader(session_id=session_id, seq_num=seq, type=RDTType.DATA),
+            AppHeader(length=0, type=msg_type, req_id=req_id),
+            payload=payload,
+        )
+ 
+        pending_seq = seq
+        ack_event.clear()
+ 
+        try:
+            for attempt in range(MAX_RETRANSMISSIONS + 1):
+                transport_send(packet)
+                if attempt == 0:
+                    print(f"[DATA SENT] seq={seq} | req_id={req_id} | payload={payload}")
+                else:
+                    print(f"[RETRANSMIT] seq={seq} | retry={attempt}/{MAX_RETRANSMISSIONS}")
+ 
+                if ack_event.wait(RETRANSMISSION_TIMEOUT):
+                    send_seq ^= 1   # advance only after the correct ACK
+                    return True
+ 
+            print(f"[TRANSMISSION FAILED] seq={seq} | retries={MAX_RETRANSMISSIONS}")
+            return False
+        finally:
+            pending_seq = None
+
+def handle_ack(datagram) -> None:
+    ack_num = datagram.rdt.ack_num
+    if pending_seq is not None and ack_num == pending_seq:
+        print(f"[ACK ACCEPTED] ack_num={ack_num}")
+        ack_event.set()
+    else:
+        print(f"[IGNORED ACK] ack_num={ack_num}")
+
+def handle_data(datagram) -> None:
+    "ACK incoming DATA, drop duplicates, pass new messages upward."
+    global expected_recv_seq
+ 
+    seq = datagram.rdt.seq_num
+ 
+    if seq not in (0, 1):
+        print(f"[REJECTED DATA] Invalid seq={seq}")
+        return
+ 
+    # Always ACK, even duplicates, in case our previous ACK was lost.
+    send_ack(seq)
+ 
+    if seq != expected_recv_seq:
+        print(f"[DUPLICATE DATA] seq={seq}")
+        return
+ 
+    expected_recv_seq ^= 1
+ 
+    if datagram.app is None:
+        print("[REJECTED DATA] Missing application header")
+        return
+ 
+    if message_handler is not None:
+        message_handler(datagram)
+
+def handle_datagram(datagram) -> None:
+    packet_type = datagram.rdt.type
+ 
+    if packet_type == RDTType.OPEN_ACK:
+        open_ack_event.set()
+    elif packet_type == RDTType.CLOSE_ACK:
+        close_ack_event.set()
+    elif packet_type == RDTType.ACK:
+        handle_ack(datagram)
+    elif packet_type == RDTType.DATA:
+        handle_data(datagram)
+    else:
+        print(f"[IGNORED] Unexpected RDT type={packet_type}")
+
+def receiver_loop() -> None:
     while running.is_set():
         try:
-            header, payload = recv_frame(sock)
-
-        except (OSError, ConnectionError, ValueError) as error:
+            datagram = transport_receive()
+        except socket.timeout:
+            continue
+        except OSError as error:
             if running.is_set():
                 print(f"\n[RECEIVER ERROR] {error}")
-            running.clear()
-            break  
+                running.clear()
+            break
+ 
+        if datagram is not None:
+            handle_datagram(datagram)
+ 
+receiver_thread = threading.Thread(target=receiver_loop, daemon=True)
 
-        if header.req_id == 0:
-            if header.type == MessageType.USER_JOIN:
-                username = payload["username"]
+# Layer 3: Session (OPEN / CLOSE handshakes)
+def control_handshake(packet_type: int, ack_event_: threading.Event, label: str) -> bool:
+    "Send a control packet, retransmitting until its ACK event is set."
+    ack_event_.clear()
+ 
+    for attempt in range(MAX_RETRANSMISSIONS + 1):
+        send_control(packet_type)
 
-                with peers_lock:
-                    peers.add(username)
+        if ack_event_.wait(RETRANSMISSION_TIMEOUT):
+            return True
+        
+        print(f"[TIMEOUT] No {label}_ACK ({attempt + 1}/{MAX_RETRANSMISSIONS + 1})")
+ 
+    return False
 
-                print(f"\n[USER JOINED] {username}")
+def open_session() -> bool:
+    global established
+ 
+    print(f"[OPENING SESSION] session={session_id.hex()}")
+    if control_handshake(RDTType.OPEN, open_ack_event, "OPEN"):
+        established = True
+        start_heartbeat()
+        print("[SESSION ESTABLISHED]")
+        return True
+ 
+    print("[SESSION FAILED] Server did not answer OPEN")
+    return False
 
-            elif header.type == MessageType.USER_LEAVE:
-                username = payload["username"]
+def close_session() -> bool:
+    global established
+ 
+    if not established:
+        return False
+ 
+    print("[CLOSING SESSION]")
+    stop_heartbeat()
+    ok = control_handshake(RDTType.CLOSE, close_ack_event, "CLOSE")
+    established = False
+    print("[SESSION CLOSED]" if ok else "[SESSION CLOSE UNCONFIRMED]")
+    return ok
 
-                with peers_lock:
-                    peers.discard(username)
+def heartbeat_loop() -> None:
+    "One-way and unacknowledged: a lost heartbeat is covered by the next one, so nothing is retransmitted."
+    # wait() returns True once heartbeat_stop is set, which ends the loop.
+    while not heartbeat_stop.wait(HEARTBEAT_INTERVAL):
+        try:
+            send_control(RDTType.HEARTBEAT, quiet=True)
+        except OSError:
+            break
 
-                print(f"\n[USER LEFT] {username}")
+def start_heartbeat() -> None:
+    global heartbeat_thread
+ 
+    heartbeat_stop.clear()
+    heartbeat_thread = threading.Thread(target=heartbeat_loop, daemon=True)
+    heartbeat_thread.start()
 
-            elif header.type == MessageType.MSG_DELIVER:
-                sender = payload.get("from", "Unknown")
-                message = payload.get("message", "")
+def stop_heartbeat() -> None:
+    heartbeat_stop.set()
+ 
+    if heartbeat_thread is not None:
+        heartbeat_thread.join(timeout=1.0)
 
-                print(f"\n[DELIVER] {sender}: {message}")
+# Layer 4: Requests (req_id <-> response matching)
+def deliver_response(datagram) -> None:
+    "Called by layer 2 for each new DATA message; routes it by req_id."
+    req_id = datagram.app.req_id
+ 
+    with pending_lock:
+        response_queue = pending_requests.get(req_id)
+ 
+    if response_queue is None:
+        print(f"[UNMATCHED RESPONSE] type={datagram.app.type} | req_id={req_id}")
+        return
+ 
+    try:
+        response_queue.put_nowait(datagram)
+    except queue.Full:
+        pass  # a response for this request is already queued
+ 
+message_handler = deliver_response
+ 
+def send_request(msg_type: int, payload: dict, timeout: float = RESPONSE_TIMEOUT):
+    "Send a request reliably and wait for the response with the same req_id."
 
-            else:
-                print(
-                    f"\n[SERVER EVENT] Type={header.type}, "
-                    f"Payload={payload}"
-                )
-
-            continue
-
-        with pending_lock:
-            response_queue = pending_requests.get(header.req_id)
-
-        if response_queue is not None:
-            response_queue.put((header, payload))
-        else:
-            print(
-                f"\n[UNMATCHED RESPONSE] Type={header.type}, "
-                f"ReqID={header.req_id}, Payload={payload}"
-            )
-
-def send_request(sock, msg_type, payload, timeout = 10):
     global next_req_id
-
+ 
+    if not established:
+        print("[ERROR] No established session")
+        return None
+ 
     with req_id_lock:
         req_id = next_req_id
         next_req_id += 1
-
+ 
+    # Register before sending so a fast response can't be missed.
     response_queue = queue.Queue(maxsize=1)
     with pending_lock:
         pending_requests[req_id] = response_queue
-
-    try: 
-        send_frame(sock, msg_type, req_id, payload)
-
-        header, response_payload = response_queue.get(timeout=timeout)
-
-        if header.type == MessageType.ERROR:
-            print(
-                f"Server error: {response_payload}"
-            )
-        else:
-            print(
-                f"Received response type: {header.type}\n"
-                f"Request ID: {header.req_id}\n"
-                f"Payload: {response_payload}"
-            )
-
-        return header, response_payload
-
-    except queue.Empty:
-        print(f"No response for request ID {req_id} within {timeout}s")
-        return None
-
+ 
+    try:
+        if not send_reliable(msg_type, req_id, payload):
+            return None
+ 
+        try:
+            return response_queue.get(timeout=timeout)
+        except queue.Empty:
+            print(f"[TIMEOUT] No response for req_id={req_id} within {timeout}s")
+            return None
     finally:
         with pending_lock:
             pending_requests.pop(req_id, None)
 
-def show_peer_list():
-    with peers_lock:
-        peer_list = sorted(peers)
-
-    if not peer_list:
-        print("No other users are currently connected.")
-        return
-
-    print(f"Connected peers ({len(peer_list)}):")
-
-    for index, username in enumerate(peer_list, start=1):
-        print(f"  {index}. {username}")
-
-def start_client():
-    client_socket = socket.socket(
-        socket.AF_INET,
-        socket.SOCK_STREAM
+def ping(message: str) -> bool:
+    response = send_request(MessageType.PING, {"message": message})
+ 
+    if response is None:
+        return False
+ 
+    if response.app.type != MessageType.PONG:
+        print(f"[UNSUPPORTED APP TYPE] {response.app.type}")
+        return False
+ 
+    print(
+        f"[PONG RECEIVED] req_id={response.app.req_id} "
+        f"| payload={response.payload}"
     )
-
+    return True
+ 
+def run() -> None:
+    receiver_thread.start()
+ 
     try:
-        client_socket.connect((HOST, PORT))
-        print(f"Connected to server at {HOST}:{PORT}")
-
-        # Step 1: Perform the handshake.
-        send_frame(
-            client_socket,
-            MessageType.HELLO,
-            req_id=1,
-            payload={"client": "Đây là test."}
-        )
-
-        # Receive the server's response.
-        header, payload = recv_frame(client_socket)
-
-        if (
-            header.type != MessageType.WELCOME
-            or header.req_id != 1
-        ):
-            print(f"Handshake failed: {payload}")
+        if not open_session():
             return
-
-        print(f"[WELCOME] {payload.get('message')}")
-
-        # Step 2: Authenticate before starting the receiver thread.
-        username = input("Username: ").strip()
-        password = input("Password: ")
-
-        send_frame(
-            client_socket,
-            MessageType.AUTH,
-            req_id=2,
-            payload={
-                "username": username,
-                "password": password,
-            },
-        )
-
-        auth_header, auth_payload = recv_frame(client_socket)
-
-        if auth_header is None or auth_header.type != MessageType.AUTH_OK or auth_header.req_id != 2:
-            print(
-                "Authentication failed: "
-                f"{auth_payload.get('message', auth_payload)}"
-            )
-            return
-
-        my_username = auth_payload["username"]
-        print(f"[AUTHENTICATED] Logged in as {my_username}")
-
-        with peers_lock:
-            peers.clear()
-            peers.update(
-                peer["username"]
-                for peer in auth_payload["peers"]
-            )
-
-        print(f"Current peers: {sorted(peers)}")
-
-        receiver_thread = threading.Thread(
-            target=receiver_loop,
-            args=(client_socket,),
-            daemon=True,
-        )
-        receiver_thread.start()
-
-        # Step 2: Exchange multiple messages.
+ 
         while True:
-            command = input("\nEnter 'ping', 'peers', 'broadcast', 'direct' or 'quit': ").strip().lower()
-
-            if command == "ping":
-                send_request(
-                    client_socket,
-                    MessageType.PING,
-                    {"message": "Ping from client"},
-                )
-
-            elif command == "peers":
-                show_peer_list()
-
-            elif command == "broadcast":
-                message = input("Broadcast message: ").strip()
-
-                send_request(
-                    client_socket,
-                    MessageType.MSG_BROADCAST,
-                    {"message": message},
-                )
-
-            elif command == "direct":
-                recipient = input("Recipient username: ").strip()
-                message = input("Direct message: ").strip()
-
-                send_request(
-                    client_socket,
-                    MessageType.MSG_DIRECT,
-                    {
-                        "to": recipient,
-                        "message": message,
-                    },
-                )
-
-            elif command == "quit":
-                    try:
-                        send_frame(
-                            client_socket,
-                            MessageType.LOGOUT,
-                            req_id=0,
-                            payload={},
-                        )
-                        print("Disconnecting...")
-
-                    except (OSError, ConnectionError, ValueError) as error:
-                        print(f"Error while sending LOGOUT: {error}")
-
-                    running.clear()
-                    break
-
-            else:
-                print("Unknown command.")
-
-    except (OSError, ConnectionError, ValueError) as error:
-        print(f"Client error: {error}")
+            message = input(
+                "\nEnter a message to ping (or 'quit' to disconnect): "
+            ).strip()
+ 
+            if message.lower() == "quit":
+                break
+            if not message:
+                continue
+ 
+            ping(message)
+ 
+    except KeyboardInterrupt:
+        print("\n[INTERRUPTED]")
 
     finally:
-        client_socket.close()
-        print("Client socket closed.")
 
+        try:
+            close_session()
+
+        finally:
+            running.clear()
+            receiver_thread.join(timeout=1.0)
+            sock.close()
+            print("[CLIENT SOCKET CLOSED]")
+ 
 if __name__ == "__main__":
-    start_client()
+    run()

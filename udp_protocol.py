@@ -23,6 +23,7 @@ class RDTType:
     ACK = 4
     CLOSE = 5
     CLOSE_ACK = 6
+    HEARTBEAT = 7
 
 class MessageType:
     HELLO = 1

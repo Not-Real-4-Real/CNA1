@@ -1,18 +1,20 @@
 import secrets
 import socket
 import time
+import threading
 
 from udp_protocol import *
 
 SERVER_HOST = "127.0.0.1"
-SERVER_PORT = 5001
-
+SERVER_PORT = 5000
 SERVER_ADDRESS = (SERVER_HOST, SERVER_PORT)
 
 BUFFER_SIZE = 1201
 
 RETRANSMISSION_TIMEOUT = 1.0
 MAX_RETRANSMISSIONS = 5
+
+HEARTBEAT_INTERVAL = 2.0
 
 class UDPClient:
     def __init__(self):
@@ -39,6 +41,21 @@ class UDPClient:
         self.sock.settimeout(0.1)
 
         self.established = False
+
+        self.running = threading.Event()
+        self.running.set()
+
+        self.state_lock = threading.Lock()
+
+        # Events signaled by the receiver thread.
+        self.ack_event = threading.Event()
+        self.pong_event = threading.Event()
+        self.close_event = threading.Event()
+        self.stop_event = threading.Event()
+
+        self.last_pong = None
+        self.receiver_thread = None
+        self.heartbeat_thread = None
 
     def send_control(self, packet_type: int) -> None:
         rdt = RDTHeader(session_id=self.session_id, type=packet_type)
@@ -102,6 +119,21 @@ class UDPClient:
                 if datagram.rdt.type == RDTType.OPEN_ACK:
                     self.established = True
                     print("[SESSION ESTABLISHED]")
+
+                    self.receiver_thread = threading.Thread(
+                        target=self.receiver_loop,
+                        name="udp-receiver",
+                        daemon=True,
+                    )
+
+                    self.heartbeat_thread = threading.Thread(
+                        target=self.heartbeat_loop,
+                        name="udp-heartbeat",
+                        daemon=True,
+                    )
+
+                    self.receiver_thread.start()
+                    self.heartbeat_thread.start()
                     return True
 
                 print(
@@ -131,15 +163,22 @@ class UDPClient:
                 if datagram.rdt.type == RDTType.CLOSE_ACK:
                     self.established = False
                     print("[SESSION CLOSED]")
+
+                    self.stop_event.set()
+                    self.running.clear()
+
+                    self.sock.close()
+
+                    if self.heartbeat_thread is not None:
+                        self.heartbeat_thread.join(timeout=1.0)
+
+                    if self.receiver_thread is not None:
+                        self.receiver_thread.join(timeout=1.0)
+                        
                     return True
 
-                print(
-                    f"[IGNORED] Expected CLOSE_ACK, "
-                    f"received RDT type={datagram.rdt.type}"
-                )
-
         except socket.timeout:
-            print("[TIMEOUT] No OPEN_ACK received")
+            print("[TIMEOUT] No CLOSE_ACK received")
             return False
 
     def handle_data(self, datagram: Datagram) -> bool:
@@ -335,6 +374,27 @@ class UDPClient:
 
         print(f"[PING COMPLETE] req_id={req_id}")
         return True
+
+    def heartbeat_loop(self):
+        while not self.stop_event.wait(HEARTBEAT_INTERVAL):
+            if not self.established:
+                break
+
+            try:
+                packet = encode_datagram(
+                    RDTHeader(
+                        session_id=self.session_id,
+                        type=RDTType.HEARTBEAT,
+                    )
+                )
+                self.sock.sendto(packet, SERVER_ADDRESS)
+                print("[HEARTBEAT SENT]")
+
+            except OSError as error:
+                if self.running.is_set():
+                    print(f"[HEARTBEAT ERROR] {error}")
+                self.running.clear()
+                break
 
     def run(self):
         try:

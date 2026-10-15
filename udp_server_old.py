@@ -1,6 +1,6 @@
 import time
 import socket
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from udp_protocol import *
 
@@ -11,10 +11,15 @@ BUFFER_SIZE = 1201
 RETRANSMISSION_TIMEOUT = 1.0  # seconds
 MAX_RETRANSMISSIONS = 5
 
+HEARTBEAT_TIMEOUT = 8.0  # seconds without valid client activity
+
 @dataclass
 class Session:
     address: tuple
     session_id: bytes
+
+    # Heartbeat checker
+    last_seen: float = field(default_factory=time.monotonic)
 
     # Outgoing DATA state
     send_seq_num: int = 0
@@ -181,6 +186,8 @@ def handle_data(
         print(f"[REJECTED DATA] Missing application data from {address}")
         return
 
+    session.last_seen = time.monotonic()
+
     seq_num = datagram.rdt.seq_num
 
     # This implementation uses alternating sequence numbers: 0 and 1.
@@ -264,6 +271,8 @@ def handle_ack(
         print(f"[REJECTED ACK] Unknown session from {address}")
         return
 
+    session.last_seen = time.monotonic()
+
     ack_num = datagram.rdt.ack_num
 
     if session.send_seq_num is None:
@@ -339,6 +348,24 @@ def check_retransmission_timeouts(
             f"{MAX_RETRANSMISSIONS}"
         )
 
+def check_session_timeouts():
+    now = time.monotonic()
+
+    for key, session in list(sessions.items()):
+        inactive_for = now - session.last_seen
+
+        if inactive_for <= HEARTBEAT_TIMEOUT:
+            continue
+
+        del sessions[key]
+
+        print(
+            f"[SESSION EXPIRED] {session.address} "
+            f"| session={session.session_id.hex()[:8]} "
+            f"| inactive={inactive_for:.1f}s "
+            f"| active sessions={len(sessions)}"
+        )
+
 def run_server():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((HOST, PORT))
@@ -353,6 +380,7 @@ def run_server():
 
             except socket.timeout:
                 check_retransmission_timeouts(sock)
+                check_session_timeouts()
                 continue
 
             print(
@@ -384,6 +412,7 @@ def run_server():
                 print(f"[UNEXPECTED DATAGRAM]")
 
             check_retransmission_timeouts(sock)
+            check_session_timeouts()
 
     except KeyboardInterrupt:
         print("\nServer shutting down.")

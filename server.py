@@ -1,452 +1,382 @@
 import socket
-import threading
+import time
+from collections import deque
+from dataclasses import dataclass, field
 
-from client_connection import ClientConnection
-from protocol import MessageType, send_frame, recv_frame
+from udp_protocol import *
 
 HOST = "127.0.0.1"
 PORT = 5000
+BUFFER_SIZE = 1201
 
-ACCOUNTS = {
-    "alice": "alice123",
-    "bob": "bob123",
-    "charlie": "charlie123",
-    "doug": "doug123",
-}
+RETRANSMISSION_TIMEOUT = 1.0   # seconds
+MAX_RETRANSMISSIONS = 5
+HEARTBEAT_TIMEOUT = 8.0        # seconds without valid client activity
 
-# Shared registry: username -> client connection.
-clients = {}
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-# Protects registry operations.
-clients_lock = threading.Lock()
+@dataclass
+class SenderState:
+    "Layer 2: our outgoing DATA toward one client."
+    seq: int = 0                                   # seq of the next DATA to send
+    outbox: deque = field(default_factory=deque)   # queued (msg_type, req_id, payload)
+    in_flight: bytes | None = None                 # exact bytes awaiting an ACK
+    in_flight_seq: int | None = None
+    sent_at: float | None = None
+    retransmissions: int = 0
 
-# Serialize join and leave so peer list stays consistent
-membership_lock = threading.Lock()
+@dataclass
+class ReceiverState:
+    "Layer 2: the client's incoming DATA toward us."
+    expected_seq: int = 0
 
-def register_client(client, username):
-    "Register the client."
+@dataclass
+class Session:
+    "Layer 3: identity + liveness. Layer 2 state hangs off it."
+    address: tuple
+    session_id: bytes
+    last_seen: float = field(default_factory=time.monotonic)
+    sender: SenderState = field(default_factory=SenderState)
+    receiver: ReceiverState = field(default_factory=ReceiverState)
 
-    with clients_lock:
-        if username in clients:
-            return False, [], []
+# Key: (client address, session ID)
+sessions: dict[tuple, Session] = {}
 
-        client.username = username
-        clients[username] = client
+# Upward hooks, wired up at the bottom of layers 3 and 4.
+message_handler = None
+failure_handler = None
 
-        peers = [
-            {"username": name}
-            for name in clients if name != username
-        ]
+# Layer 1: Transport
+def transport_send(address: tuple, packet: bytes) -> None:
+    sock.sendto(packet, address)
 
-        existing_clients = [
-            peer for name, peer in clients.items() if name != username
-        ]
+def transport_receive():
+    "Read and decode one datagram. Returns (address, datagram), or None"
+    data, address = sock.recvfrom(BUFFER_SIZE)
 
-    return True, peers, existing_clients
+    print(f"\n[DATAGRAM RECEIVED] {address} | bytes={len(data)}")
 
-def unregister_client(client):
-    "Remove a client from the registry if registered."
-    if client.username is None:
+    try:
+        return address, decode_datagram(data)
+    except ValueError as error:
+        print(f"[INVALID DATAGRAM] {address}: {error}")
+        return None
+
+# Layer 2: Reliable delivery (per session)
+def send_control(address: tuple, session_id: bytes, packet_type: int) -> None:
+    "Send a header-only RDT packet (OPEN_ACK / CLOSE_ACK). Not sequenced."
+    transport_send(
+        address,
+        encode_datagram(RDTHeader(session_id=session_id, type=packet_type)),
+    )
+
+def send_ack(session: Session, ack_num: int) -> None:
+    transport_send(
+        session.address,
+        encode_datagram(
+            rdt=RDTHeader(
+                session_id=session.session_id,
+                ack_num=ack_num,
+                type=RDTType.ACK,
+            )
+        ),
+    )
+    print(f"[ACK SENT] {session.address} | ack_num={ack_num}")
+
+def send_reliable(session: Session, msg_type: int, req_id: int, payload: dict) -> None:
+    """Queue a message for reliable delivery. It is sent immediately if nothing is
+    in flight, otherwise as soon as the previous DATA has been ACKed. Messages
+    are never dropped just because an earlier one is still unACKed."""
+
+    session.sender.outbox.append((msg_type, req_id, payload))
+    pump_outbox(session)
+
+def pump_outbox(session: Session) -> None:
+    "If the channel is idle, transmit the next queued message."
+    sender = session.sender
+
+    if sender.in_flight is not None or not sender.outbox:
         return
 
-    with membership_lock:
-        with clients_lock:
-            username = client.username
-            if clients.get(username) is not client:
-                client.username = None
-                return
+    msg_type, req_id, payload = sender.outbox.popleft()
 
-            del clients[username]
-
-            remaining_clients = list(clients.values())
-            active_count = len(clients)
-
-        for peer in remaining_clients:
-            try:
-                send_to_client(
-                    peer,
-                    MessageType.USER_LEAVE,
-                    req_id = 0,
-                    payload={"username": username}
-                )
-            except (OSError, ConnectionError, ValueError) as error:
-                print(
-                    f"[NOTIFY ERROR] Could not notify "
-                    f"{peer.username} about {username} leaving: {error}"
-                )
-
-        client.username = None
-
-    print(
-        f"[UNREGISTERED] {client.username} | "
-        f"{client.address} | Active clients: {active_count}"
+    packet = encode_datagram(
+        rdt=RDTHeader(
+            session_id=session.session_id,
+            seq_num=sender.seq,
+            type=RDTType.DATA,
+        ),
+        app=AppHeader(length=0, type=msg_type, req_id=req_id),
+        payload=payload,
     )
 
-def get_connected_users():
-    "Return a snapshot of currently registered usernames."
-    with clients_lock:
-        return list(clients.keys())
+    # Keep the exact bytes so a retransmission is identical.
+    sender.in_flight = packet
+    sender.in_flight_seq = sender.seq
+    sender.sent_at = time.monotonic()
+    sender.retransmissions = 0
 
-def broadcast_message(sender, message):
-    with clients_lock:
-        recipients = [client for client in clients.values() if client is not sender]
-
-    successful_sends = 0
-
-    for recipient in recipients:
-        try:
-            send_to_client(
-                recipient,
-                MessageType.MSG_DELIVER,
-                req_id=0,
-                payload={
-                    "from": sender.username,
-                    "message": message,
-                },
-            )
-            successful_sends += 1
-
-        except (OSError, ConnectionError, ValueError) as error:
-            print(
-                f"[BROADCAST ERROR] Could not send to "
-                f"{recipient.username}: {error}"
-            )    
+    transport_send(session.address, packet)
 
     print(
-        f"[BROADCAST] {sender.username} -> "
-        f"{successful_sends}/{len(recipients)} recipients"
+        f"[DATA SENT] {session.address} "
+        f"| seq={sender.seq} "
+        f"| type={msg_type} "
+        f"| req_id={req_id} "
+        f"| awaiting ACK"
     )
 
-    return successful_sends
+def handle_ack(session: Session, datagram: Datagram) -> None:
+    "Process an ACK for our in-flight DATA."
+    sender = session.sender
+    ack_num = datagram.rdt.ack_num
 
-def direct_message(sender, receiver_username, message):
-    with clients_lock:
-        recipient = clients.get(receiver_username)
+    if sender.in_flight is None:
+        print(
+            f"[UNEXPECTED ACK] {session.address} "
+            f"| ack_num={ack_num} | no outstanding DATA"
+        )
+        return
 
-    if recipient is None:
-        return False, {
-            "code": 404,
-            "message": f"User '{receiver_username}' is not connected",
-        }
-    
-    try:
-        send_to_client(
-            recipient,
-            MessageType.MSG_DELIVER,
-            req_id=0,
-            payload={
-                "from": sender.username,
-                "message": message,
-            },
+    # A stale or unrelated ACK must not clear the in-flight packet.
+    if ack_num != sender.in_flight_seq:
+        print(
+            f"[IGNORED ACK] {session.address} "
+            f"| ack_num={ack_num} | expected={sender.in_flight_seq}"
+        )
+        return
+
+    print(
+        f"[ACK ACCEPTED] {session.address} "
+        f"| ack_num={ack_num} | retries={sender.retransmissions}"
+    )
+
+    sender.in_flight = None
+    sender.in_flight_seq = None
+    sender.sent_at = None
+    sender.retransmissions = 0
+    sender.seq ^= 1          # alternate 0 -> 1 -> 0 -> ...
+
+    pump_outbox(session)     # send the next queued message, if any
+
+def handle_data(session: Session, datagram: Datagram) -> None:
+    "ACK incoming DATA, drop duplicates, pass new messages upward."
+    receiver = session.receiver
+    seq = datagram.rdt.seq_num
+
+    if seq not in (0, 1):
+        print(f"[REJECTED DATA] Invalid seq={seq} from {session.address}")
+        return
+
+    # Always ACK, even duplicates, in case our previous ACK was lost.
+    send_ack(session, seq)
+
+    if seq != receiver.expected_seq:
+        print(f"[DUPLICATE DATA] {session.address} | seq={seq} | ACK resent")
+        return
+
+    receiver.expected_seq ^= 1
+
+    if datagram.app is None:
+        print(f"[REJECTED DATA] Missing application header from {session.address}")
+        return
+
+    print(
+        f"[DATA ACCEPTED] {session.address} "
+        f"| seq={seq} | req_id={datagram.app.req_id}"
+    )
+
+    if message_handler is not None:
+        message_handler(session, datagram)
+
+def check_retransmission(session: Session) -> None:
+    "Retransmit this session's in-flight DATA if its timer expired."
+    sender = session.sender
+
+    if sender.in_flight is None or sender.sent_at is None:
+        return
+
+    now = time.monotonic()
+
+    if now - sender.sent_at < RETRANSMISSION_TIMEOUT:
+        return
+
+    if sender.retransmissions >= MAX_RETRANSMISSIONS:
+        print(
+            f"[TRANSMISSION FAILED] {session.address} "
+            f"| seq={sender.in_flight_seq} | retries={sender.retransmissions}"
+        )
+        if failure_handler is not None:
+            failure_handler(session)
+        return
+
+    transport_send(session.address, sender.in_flight)
+    sender.retransmissions += 1
+    sender.sent_at = now
+
+    print(
+        f"[RETRANSMIT] {session.address} "
+        f"| seq={sender.in_flight_seq} "
+        f"| retry={sender.retransmissions}/{MAX_RETRANSMISSIONS}"
+    )
+
+# Layer 3: Sessions
+def handle_open(address: tuple, session_id: bytes) -> None:
+    "Create a session, or repeat the response to a repeated OPEN."
+    key = (address, session_id)
+    session = sessions.get(key)
+
+    if session is None:
+        sessions[key] = Session(address=address, session_id=session_id)
+        print(f"[SESSION OPENED] {address} | session={session_id.hex()}")
+    else:
+        session.last_seen = time.monotonic()
+        print(f"[OPEN REPEATED] {address} | session={session_id.hex()}")
+
+    send_control(address, session_id, RDTType.OPEN_ACK)
+
+def handle_close(address: tuple, session_id: bytes) -> None:
+    key = (address, session_id)
+
+    if sessions.pop(key, None) is None:
+        print(f"[CLOSE REPEATED] Unknown session from {address} | re-ACKing")
+    else:
+        print(
+            f"[SESSION CLOSED] {address} "
+            f"| session={session_id.hex()[:8]} "
+            f"| active sessions={len(sessions)}"
         )
 
-    except (OSError, ConnectionError, ValueError) as error:
-        print(
-            f"[DIRECT ERROR] Could not send to "
-            f"{receiver_username}: {error}"
-        ) 
-        return False, {
-            "code": 503,
-            "message": f"Could not deliver message to '{receiver_username}'",
-        }   
+    send_control(address, session_id, RDTType.CLOSE_ACK)
 
+def drop_session(session: Session, reason: str) -> None:
+    sessions.pop((session.address, session.session_id), None)
     print(
-        f"[DIRECT] {sender.username} -> {receiver_username}"
-    )
-    return True, None
-
-def send_to_client(client, msg_type, req_id, payload, flags=0):
-    "Send one complete frame safely to a client."
-    with client.send_lock:
-        send_frame(
-            client.sock,
-            msg_type,
-            req_id,
-            payload,
-            flags=flags,
-        ) 
-
-def handle_client(client_socket, client_address):
-    "Thread to handle 1 client"
-    client = ClientConnection(sock=client_socket, address=client_address)
-
-    print(f"[TCP CONNECTED] {client_address}")
-
-    try:
-        # Timeout for testing connection timeout.
-        # client.sock.settimeout(10.0)
-
-        with client.sock:
-            # 1. Receive and validate the handshake.
-            hello_header, hello_payload = recv_frame(client.sock)
-
-            if hello_header.type != MessageType.HELLO:
-                send_to_client(
-                    client,
-                    MessageType.ERROR,
-                    hello_header.req_id,
-                    {
-                        "code": 400,
-                        "message": "Expected HELLO",
-                    },
-                )
-                return
-
-            # 2. Complete the handshake.
-            send_to_client(
-                client,
-                MessageType.WELCOME,
-                hello_header.req_id,
-                {
-                    "message": "Connection established",
-
-                },
-            )
-
-            print(f"[HELLO] TCP session established: {client.address}")
-
-            auth_header, auth_payload = recv_frame(client.sock)
-
-            if auth_header.type != MessageType.AUTH:
-                send_to_client(
-                    client,
-                    MessageType.ERROR,
-                    auth_header.req_id,
-                    {
-                        "code": 401,
-                        "message": "Authentication required"
-                    },
-                )
-                return
-
-            username = auth_payload.get("username")
-            password = auth_payload.get("password")
-
-            if (
-                not isinstance(username, str)
-                or not username
-                or not isinstance(password, str)
-                or not password
-                or ACCOUNTS.get(username) != password
-            ):
-                send_to_client(
-                    client,
-                    MessageType.ERROR,
-                    auth_header.req_id,
-                    {
-                        "code": 401,
-                        "message": "Invalid username or password"
-                    },
-                )
-                return
-
-            # 2. Register only after receiving a valid AUTH.
-            with membership_lock:
-                registered, peers, existing_clients = register_client(client, username)
-
-                if not registered:
-                    send_to_client(
-                        client,
-                        MessageType.ERROR,
-                        auth_header.req_id,
-                        {
-                            "code": 409,
-                            "message": "Account already connected"
-                        },
-                    )
-                    return
-
-                send_to_client(
-                    client,
-                    MessageType.AUTH_OK,
-                    auth_header.req_id,
-                    {
-                        "username": username,
-                        "message": "Authentication successful",
-                        "peers": peers,
-                    },
-                )
-
-                for peer in existing_clients:
-                    try:
-                        send_to_client(
-                            peer,
-                            MessageType.USER_JOIN,
-                            req_id=0,
-                            payload={"username": username},
-                        )
-                    except (OSError, ConnectionError, ValueError) as error:
-                        print(
-                            f"[NOTIFY ERROR] Could not notify "
-                            f"{peer.username} about {username} joining: "
-                            f"{error}"
-                        )
-
-            print(
-                f"[AUTH OK] {username} | {client.address} | "
-                f"Active clients: {len(clients)}"
-            )
-
-            # Step 2: Keep the connection alive.
-            while True:
-                header, payload = recv_frame(client_socket)
-
-                print(
-                    f"[RECEIVED] {client_address} | "
-                    f"Type: {header.type} | "
-                    f"ReqID: {header.req_id} | "
-                    f"Payload length: {header.length} | "
-                    f"Payload: {payload}"
-                )
-
-                if header.type == MessageType.PING:
-                    send_frame(
-                        client_socket,
-                        MessageType.PONG,
-                        header.req_id,
-                        {"message": "Pong from server"},
-                    )
-
-                elif header.type == MessageType.MSG_BROADCAST:
-                    message = payload.get("message")
-
-                    if not isinstance(message, str) or not message.strip():
-                        send_to_client(
-                            client,
-                            MessageType.ERROR,
-                            header.req_id,
-                            {
-                                "code": 400,
-                                "message": "Broadcast message must be a non-empty string",
-                            },
-                        )
-                        continue
-
-                    recipient_count = broadcast_message(client, message)
-
-                    send_to_client(
-                        client,
-                        MessageType.MSG_SENT,
-                        header.req_id,
-                        {
-                            "message": "Broadcast accepted",
-                            "recipients": recipient_count,
-                        },
-                    )
-
-                elif header.type == MessageType.MSG_DIRECT:
-                    receiver = payload.get("to")
-                    message = payload.get("message")
-
-                    if (not isinstance(receiver, str) or not receiver.strip()):
-                        send_to_client(
-                            client,
-                            MessageType.ERROR,
-                            header.req_id,
-                            {
-                                "code": 400,
-                                "message": "A recipient username is required",
-                            },
-                        )
-                        continue
-
-                    if (not isinstance(message, str) or not message.strip()):
-                        send_to_client(
-                            client,
-                            MessageType.ERROR,
-                            header.req_id,
-                            {
-                                "code": 400,
-                                "message": "Direct message must be a non-empty string",
-                            },
-                        )
-                        continue
-
-                    receiver = receiver.strip()
-
-                    success, error_payload = direct_message(
-                        client,
-                        receiver,
-                        message,
-                    )
-
-                    if not success:
-                        send_to_client(
-                            client,
-                            MessageType.ERROR,
-                            header.req_id,
-                            error_payload,
-                        )
-                        continue
-
-                    send_to_client(
-                        client,
-                        MessageType.MSG_SENT,
-                        header.req_id,
-                        {
-                            "message": "Direct message accepted",
-                            "recipient": receiver,
-                        },
-                    )
-
-                elif header.type == MessageType.LOGOUT:
-                    print(f"[LOGOUT] {client_address}")
-                    break
-
-                else:
-                    send_frame(
-                        client_socket,
-                        MessageType.ERROR,
-                        header.req_id,
-                        {
-                            "code": 400,
-                            "message": "Unsupported message type",
-                        },
-                    )
-
-    except socket.timeout:
-        print(f"[TIMEOUT] {client_address} did not send data in time")
-
-    except (OSError, ConnectionError, ValueError) as error:
-        print(f"[CONNECTION ERROR] {client_address}: {error}")
-
-    finally:
-        unregister_client(client)
-
-def start_server():
-    # 1. Create a TCP socket using IPv4.
-    server_socket = socket.socket(
-        socket.AF_INET,
-        socket.SOCK_STREAM
+        f"[SESSION DROPPED] {session.address} "
+        f"| session={session.session_id.hex()[:8]} "
+        f"| reason={reason} "
+        f"| active sessions={len(sessions)}"
     )
 
+def on_transmission_failed(session: Session) -> None:
+    "Layer 2 gave up on this client, so invalidate the session."
+    drop_session(session, "transmission failed")
+
+failure_handler = on_transmission_failed
+
+def check_session_timeouts() -> None:
+    now = time.monotonic()
+
+    # Snapshot: sessions are removed while iterating.
+    for session in list(sessions.values()):
+        inactive_for = now - session.last_seen
+        if inactive_for > HEARTBEAT_TIMEOUT:
+            drop_session(session, f"inactive {inactive_for:.1f}s")
+
+def check_retransmissions() -> None:
+    for session in list(sessions.values()):
+        check_retransmission(session)
+
+def dispatch_datagram(address: tuple, datagram: Datagram) -> None:
+    "Route a decoded datagram to the right session / reliable handler."
+    rdt = datagram.rdt
+
+    if rdt.type == RDTType.OPEN:
+        handle_open(address, rdt.session_id)
+        return
+
+    if rdt.type == RDTType.CLOSE:
+        handle_close(address, rdt.session_id)
+        return
+
+    if rdt.type not in (RDTType.DATA, RDTType.ACK, RDTType.HEARTBEAT):
+        print(f"[UNEXPECTED DATAGRAM] type={rdt.type} from {address}")
+        return
+
+    # Everything below needs an established session. Look it up once, here.
+    session = sessions.get((address, rdt.session_id))
+
+    if session is None:
+        print(f"[REJECTED] Unknown session from {address} | type={rdt.type}")
+        return
+
+    session.last_seen = time.monotonic()
+
+    if rdt.type == RDTType.DATA:
+        handle_data(session, datagram)
+    elif rdt.type == RDTType.ACK:
+        handle_ack(session, datagram)
+
+# Layer 4: Application
+def handle_ping(session: Session, datagram: Datagram) -> None:
+    req_id = datagram.app.req_id
+    payload = datagram.payload
+
+    print(f"[PING RECEIVED] {session.address} | req_id={req_id} | payload={payload}")
+
+    send_reliable(
+        session,
+        MessageType.PONG,
+        req_id,
+        {
+            "message": "Pong from server",
+            "echo": payload.get("message"),
+        },
+    )
+
+# Add new message types here (broadcast, direct, file transfer, ...).
+MESSAGE_HANDLERS = {
+    MessageType.PING: handle_ping,
+}
+
+def dispatch_message(session: Session, datagram: Datagram) -> None:
+    "Called by layer 2 for each new DATA message; routes it by app type."
+    if datagram.payload is None:
+        print(f"[REJECTED DATA] Missing payload from {session.address}")
+        return
+
+    handler = MESSAGE_HANDLERS.get(datagram.app.type)
+
+    if handler is None:
+        print(f"[UNSUPPORTED APP TYPE] {datagram.app.type} from {session.address}")
+        return
+
+    handler(session, datagram)
+
+message_handler = dispatch_message
+
+# Main loop
+def tick() -> None:
+    "Periodic work: retransmission timers and session expiry."
+    check_retransmissions()
+    check_session_timeouts()
+
+def run_server() -> None:
+    sock.bind((HOST, PORT))
+    sock.settimeout(0.1)
+
+    print(f"UDP server listening on {HOST}:{PORT}")
+
     try:
-        server_socket.bind((HOST, PORT))
-        server_socket.listen(5)
-
-        print(f"Server listening on {HOST}:{PORT}")
-
         while True:
-            client_socket, client_address = server_socket.accept()
+            try:
+                received = transport_receive()
+            except socket.timeout:
+                tick()
+                continue
 
-            # Give each client its own thread.
-            client_thread = threading.Thread(
-                target=handle_client,
-                args=(client_socket, client_address),
-                daemon=True,
-            )
-            client_thread.start()
+            if received is not None:
+                address, datagram = received
+                dispatch_datagram(address, datagram)
+
+            tick()
 
     except KeyboardInterrupt:
         print("\nServer shutting down.")
-        
-    except OSError as error:
-        print(f"Socket error: {error}")
 
     finally:
-        server_socket.close()
-        print("Server socket closed.")
+        sock.close()
 
 
 if __name__ == "__main__":
-    start_server()
+    run_server()
