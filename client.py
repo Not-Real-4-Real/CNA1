@@ -51,6 +51,13 @@ EVENT_REQ_ID = 0                  # one-way server events carry req_id 0
 peers = set()                     # usernames of other connected users
 peers_lock = threading.Lock()
 
+# Printing
+print_lock = threading.Lock()
+
+def log(*args, **kwargs):
+    with print_lock:
+        print(*args, **kwargs)
+
 # Layer 1: Transport
 def transport_send(packet: bytes) -> None:
     sock.sendto(packet, SERVER_ADDRESS)
@@ -59,17 +66,17 @@ def transport_receive():
     data, address = sock.recvfrom(BUFFER_SIZE)
  
     if address != SERVER_ADDRESS:
-        print(f"[IGNORED] Unexpected sender: {address}")
+        log(f"[IGNORED] Unexpected sender: {address}")
         return None
  
     try:
         datagram = decode_datagram(data)
     except ValueError as error:
-        print(f"[INVALID DATAGRAM] {error}")
+        log(f"[INVALID DATAGRAM] {error}")
         return None
  
     if datagram.rdt.session_id != session_id:
-        print("[IGNORED] Session ID mismatch")
+        log("[IGNORED] Session ID mismatch")
         return None
  
     return datagram
@@ -81,7 +88,7 @@ def send_control(packet_type: int, quiet: bool = False) -> None:
         encode_datagram(RDTHeader(session_id=session_id, type=packet_type))
     )
     if not quiet:
-        print(f"[SENT CONTROL] type={packet_type} | session={session_id.hex()[:8]}")
+        log(f"[SENT CONTROL] type={packet_type} | session={session_id.hex()[:8]}")
 
 def send_ack(ack_num: int) -> None:
     transport_send(
@@ -89,7 +96,7 @@ def send_ack(ack_num: int) -> None:
             RDTHeader(session_id=session_id, ack_num=ack_num, type=RDTType.ACK)
         )
     )
-    print(f"[ACK SENT] ack_num={ack_num}")
+    log(f"[ACK SENT] ack_num={ack_num}")
 
 def send_reliable(msg_type: int, req_id: int, payload: dict) -> bool:
     global send_seq, pending_seq
@@ -109,15 +116,15 @@ def send_reliable(msg_type: int, req_id: int, payload: dict) -> bool:
             for attempt in range(MAX_RETRANSMISSIONS + 1):
                 transport_send(packet)
                 if attempt == 0:
-                    print(f"[DATA SENT] seq={seq} | req_id={req_id} | payload={payload}")
+                    log(f"[DATA SENT] seq={seq} | req_id={req_id} | payload={payload}")
                 else:
-                    print(f"[RETRANSMIT] seq={seq} | retry={attempt}/{MAX_RETRANSMISSIONS}")
+                    log(f"[RETRANSMIT] seq={seq} | retry={attempt}/{MAX_RETRANSMISSIONS}")
  
                 if ack_event.wait(RETRANSMISSION_TIMEOUT):
                     send_seq ^= 1   # advance only after the correct ACK
                     return True
  
-            print(f"[TRANSMISSION FAILED] seq={seq} | retries={MAX_RETRANSMISSIONS}")
+            log(f"[TRANSMISSION FAILED] seq={seq} | retries={MAX_RETRANSMISSIONS}")
             return False
         finally:
             pending_seq = None
@@ -125,10 +132,10 @@ def send_reliable(msg_type: int, req_id: int, payload: dict) -> bool:
 def handle_ack(datagram) -> None:
     ack_num = datagram.rdt.ack_num
     if pending_seq is not None and ack_num == pending_seq:
-        print(f"[ACK ACCEPTED] ack_num={ack_num}")
+        log(f"[ACK ACCEPTED] ack_num={ack_num}")
         ack_event.set()
     else:
-        print(f"[IGNORED ACK] ack_num={ack_num}")
+        log(f"[IGNORED ACK] ack_num={ack_num}")
 
 def handle_data(datagram) -> None:
     "ACK incoming DATA, drop duplicates, pass new messages upward."
@@ -137,26 +144,26 @@ def handle_data(datagram) -> None:
     seq = datagram.rdt.seq_num
 
     if seq not in (0, 1):
-        print(f"[REJECTED DATA] Invalid seq={seq}")
+        log(f"[REJECTED DATA] Invalid seq={seq}")
         return
 
     # Always ACK, even duplicates, in case our previous ACK was lost.
     send_ack(seq)
 
     if seq != expected_recv_seq:
-        print(f"[DUPLICATE DATA] seq={seq}")
+        log(f"[DUPLICATE DATA] seq={seq}")
         return
 
     expected_recv_seq ^= 1
 
     if datagram.app is None:
-        print("[REJECTED DATA] Missing application header")
+        log("[REJECTED DATA] Missing application header")
         return
 
     if message_handler is not None:
         message_handler(datagram)
     else:
-        print("[ERROR] message_handler is None")
+        log("[ERROR] message_handler is None")
 
 def handle_datagram(datagram) -> None:
     packet_type = datagram.rdt.type
@@ -170,7 +177,7 @@ def handle_datagram(datagram) -> None:
     elif packet_type == RDTType.DATA:
         handle_data(datagram)
     else:
-        print(f"[IGNORED] Unexpected RDT type={packet_type}")
+        log(f"[IGNORED] Unexpected RDT type={packet_type}")
 
 def receiver_loop() -> None:
     while running.is_set():
@@ -180,7 +187,7 @@ def receiver_loop() -> None:
             continue
         except OSError as error:
             if running.is_set():
-                print(f"\n[RECEIVER ERROR] {error}")
+                log(f"\n[RECEIVER ERROR] {error}")
                 running.clear()
             break
  
@@ -200,7 +207,7 @@ def control_handshake(packet_type: int, ack_event_: threading.Event, label: str)
         if ack_event_.wait(RETRANSMISSION_TIMEOUT):
             return True
         
-        print(f"[TIMEOUT] No {label}_ACK ({attempt + 1}/{MAX_RETRANSMISSIONS + 1})")
+        log(f"[TIMEOUT] No {label}_ACK ({attempt + 1}/{MAX_RETRANSMISSIONS + 1})")
  
     return False
 
@@ -232,14 +239,14 @@ def stop_heartbeat() -> None:
 def open_session() -> bool:
     global established
  
-    print(f"[OPENING SESSION] session={session_id.hex()}")
+    log(f"[OPENING SESSION] session={session_id.hex()}")
     if control_handshake(RDTType.OPEN, open_ack_event, "OPEN"):
         established = True
         start_heartbeat()
-        print("[SESSION ESTABLISHED]")
+        log("[SESSION ESTABLISHED]")
         return True
  
-    print("[SESSION FAILED] Server did not answer OPEN")
+    log("[SESSION FAILED] Server did not answer OPEN")
     return False
 
 def close_session() -> bool:
@@ -248,11 +255,11 @@ def close_session() -> bool:
     if not established:
         return False
  
-    print("[CLOSING SESSION]")
+    log("[CLOSING SESSION]")
     stop_heartbeat()   # no heartbeat should trail after the CLOSE
     ok = control_handshake(RDTType.CLOSE, close_ack_event, "CLOSE")
     established = False
-    print("[SESSION CLOSED]" if ok else "[SESSION CLOSE UNCONFIRMED]")
+    log("[SESSION CLOSED]" if ok else "[SESSION CLOSE UNCONFIRMED]")
     return ok
 
 # Layer 4: Requests (req_id <-> response matching)
@@ -260,15 +267,15 @@ def show_peer_list() -> None:
     with peers_lock:
         peer_snapshot = sorted(peers)
 
-    print("\n========== ONLINE PEERS ==========")
+    log("\n========== ONLINE PEERS ==========")
 
     if not peer_snapshot:
-        print("No other peers are currently online.")
+        log("No other peers are currently online.")
     else:
         for index, username in enumerate(peer_snapshot, start=1):
-            print(f"{index}. {username}")
+            log(f"{index}. {username}")
 
-    print("==================================")
+    log("==================================")
 
 def handle_server_event(datagram) -> None:
     "Handle one-way server events (req_id 0)."    
@@ -281,34 +288,34 @@ def handle_server_event(datagram) -> None:
         if not isinstance(users, list) or not all(
             isinstance(username, str) for username in users
         ):
-            print("[INVALID USER_LIST] Malformed peer list")
+            log("[INVALID USER_LIST] Malformed peer list")
             return
 
         with peers_lock:
             peers.clear()
             peers.update(users)
 
-        print(f"\n[PEER LIST UPDATED] {len(users)} peer(s)")
+        log(f"\n[PEER LIST UPDATED] {len(users)} peer(s)")
 
     elif msg_type == MessageType.USER_JOIN:
         username = payload["username"]
         with peers_lock:
             peers.add(username)
-        print(f"\n[USER JOINED] {username}")
+        log(f"\n[USER JOINED] {username}")
 
     elif msg_type == MessageType.USER_LEAVE:
         username = payload["username"]
         with peers_lock:
             peers.discard(username)
-        print(f"\n[USER LEFT] {username}")
+        log(f"\n[USER LEFT] {username}")
 
     elif msg_type == MessageType.MSG_DELIVER:
         sender = payload.get("from", "Unknown")
         message = payload.get("message", "")
-        print(f"\n[DELIVER] {sender}: {message}")
+        log(f"\n[DELIVER] {sender}: {message}")
 
     else:
-        print(
+        log(
             f"\n[SERVER EVENT] type={msg_type} "
             f"| payload={payload}"
         )
@@ -326,7 +333,7 @@ def deliver_response(datagram) -> None:
         response_queue = pending_requests.get(req_id)
  
     if response_queue is None:
-        print(f"[UNMATCHED RESPONSE] type={datagram.app.type} | req_id={req_id}")
+        log(f"[UNMATCHED RESPONSE] type={datagram.app.type} | req_id={req_id}")
         return
  
     try:
@@ -342,7 +349,7 @@ def send_request(msg_type: int, payload: dict, timeout: float = RESPONSE_TIMEOUT
     global next_req_id
  
     if not established:
-        print("[ERROR] No established session")
+        log("[ERROR] No established session")
         return None
  
     with req_id_lock:
@@ -361,7 +368,7 @@ def send_request(msg_type: int, payload: dict, timeout: float = RESPONSE_TIMEOUT
         try:
             return response_queue.get(timeout=timeout)
         except queue.Empty:
-            print(f"[TIMEOUT] No response for req_id={req_id} within {timeout}s")
+            log(f"[TIMEOUT] No response for req_id={req_id} within {timeout}s")
             return None
     finally:
         with pending_lock:
@@ -374,10 +381,10 @@ def ping(message: str) -> bool:
         return False
  
     if response.app.type != MessageType.PONG:
-        print(f"[UNSUPPORTED APP TYPE] {response.app.type}")
+        log(f"[UNSUPPORTED APP TYPE] {response.app.type}")
         return False
  
-    print(
+    log(
         f"[PONG RECEIVED] req_id={response.app.req_id} "
         f"| payload={response.payload}"
     )
@@ -387,7 +394,7 @@ def broadcast(message: str) -> bool:
     message = message.strip()
 
     if not message:
-        print("[ERROR] Broadcast message cannot be empty")
+        log("[ERROR] Broadcast message cannot be empty")
         return False
 
     response = send_request(
@@ -396,22 +403,62 @@ def broadcast(message: str) -> bool:
     )
 
     if response is None:
-        print("[BROADCAST FAILED] No application response")
+        log("[BROADCAST FAILED] No application response")
         return False
 
     if response.app.type == MessageType.ERROR:
-        print(f"[BROADCAST ERROR] {response.payload}")
+        log(f"[BROADCAST ERROR] {response.payload}")
         return False
 
     if response.app.type != MessageType.MSG_SENT:
-        print(
+        log(
             f"[UNEXPECTED RESPONSE] "
             f"type={response.app.type} "
             f"| payload={response.payload}"
         )
         return False
 
-    print(f"[BROADCAST ACCEPTED] {response.payload}")
+    log(f"[BROADCAST ACCEPTED] {response.payload}")
+    return True
+
+def direct(recipient: str, message: str) -> bool:
+    recipient = recipient.strip()
+
+    if not recipient:
+        log("[ERROR] Direct need a to")
+        return False
+    
+    message = message.strip()
+
+    if not message:
+        log("[ERROR] Direct message cannot be empty")
+        return False
+
+    response = send_request(
+        MessageType.MSG_DIRECT,
+        {
+            "to": recipient,
+            "message": message,
+        },
+    )
+
+    if response is None:
+        log("[DIRECT FAILED] No application response")
+        return False
+
+    if response.app.type == MessageType.ERROR:
+        log(f"[DIRECT ERROR] {response.payload}")
+        return False
+
+    if response.app.type != MessageType.MSG_SENT:
+        log(
+            f"[UNEXPECTED RESPONSE] "
+            f"type={response.app.type} "
+            f"| payload={response.payload}"
+        )
+        return False
+
+    log(f"[DIRECT ACCEPTED] {response.payload}")
     return True
 
 def run() -> None:
@@ -423,7 +470,7 @@ def run() -> None:
  
         while True:
             command = input(
-                "\nCommands: 'peers', 'ping', 'broadcast', 'quit': "
+                "\nCommands: 'peers', 'ping', 'broadcast', 'direct', 'quit': "
             ).strip().lower()
 
             if command == "quit":
@@ -437,17 +484,22 @@ def run() -> None:
                 if message:
                     ping(message)
                 else:
-                    print("[ERROR] Ping message cannot be empty")
+                    log("[ERROR] Ping message cannot be empty")
 
             elif command == "broadcast":
                 message = input("Broadcast message: ").strip()
                 broadcast(message)
 
+            elif command == "direct":
+                recipient = input("Recipient username: ").strip()
+                message = input("Direct message: ").strip()
+                direct(recipient, message)
+
             else:
-                print("Unknown command.")
+                log("Unknown command.")
  
     except KeyboardInterrupt:
-        print("\n[INTERRUPTED]")
+        log("\n[INTERRUPTED]")
 
     finally:
 
@@ -458,7 +510,7 @@ def run() -> None:
             running.clear()
             receiver_thread.join(timeout=1.0)
             sock.close()
-            print("[CLIENT SOCKET CLOSED]")
+            log("[CLIENT SOCKET CLOSED]")
  
 if __name__ == "__main__":
     run()

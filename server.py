@@ -497,10 +497,102 @@ def handle_broadcast(session: Session, datagram: Datagram) -> None:
         f"| recipients={len(recipients)}"
     )
 
+def handle_direct(session: Session, datagram: Datagram) -> None:
+    """Handle a client broadcast request."""
+    req_id = datagram.app.req_id
+    payload = datagram.payload\
+
+    receiver_username = payload.get("to")
+    message = payload.get("message")
+
+    if not isinstance(receiver_username, str) or not receiver_username.strip():
+        send_reliable(
+            session,
+            MessageType.ERROR,
+            req_id,
+            {
+                "code": 400,
+                "message": "A recipient username is required",
+            },
+        )
+        return
+    
+    if not isinstance(message, str) or not message.strip():
+        send_reliable(
+            session,
+            MessageType.ERROR,
+            req_id,
+            {
+                "code": 400,
+                "message": "Broadcast message must be a non-empty string",
+            },
+        )
+        return
+
+    receiver_username = receiver_username.strip()
+    
+    # 2. Identify the sender.
+    sender_username = client_names.get(session_key(session))
+
+    if sender_username is None:
+        send_reliable(
+            session,
+            MessageType.ERROR,
+            req_id,
+            {
+                "code": 401,
+                "message": "Sender is not registered",
+            },
+        )
+        return
+
+    recipient_session = clients.get(receiver_username)
+
+    if recipient_session is None:
+        send_reliable(
+            session,
+            MessageType.ERROR,
+            req_id,
+            {
+                "code": 404,
+                "message": f"User '{receiver_username}' is not connected",
+            },
+        )
+        return
+
+    message = message.strip()
+    delivery_payload = {
+        "from": sender_username,
+        "message": message,
+    }
+
+    send_reliable(
+        recipient_session,
+        MessageType.MSG_DELIVER,
+        EVENT_REQ_ID,
+        delivery_payload,
+    )
+
+    print(
+        f"[DIRECT QUEUED] {sender_username} -> {receiver_username}"
+    )
+
+    # 6. Confirm application-level acceptance to the sender.
+    send_reliable(
+        session,
+        MessageType.MSG_SENT,
+        req_id,
+        {
+            "message": "Direct message accepted",
+            "recipient": receiver_username,
+        },
+    )
+
 # Add new message types here (broadcast, direct, file transfer, ...).
 MESSAGE_HANDLERS = {
     MessageType.PING: handle_ping,
     MessageType.MSG_BROADCAST: handle_broadcast,
+    MessageType.MSG_DIRECT: handle_direct,
 }
 
 def dispatch_message(session: Session, datagram: Datagram) -> None:
