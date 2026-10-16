@@ -35,6 +35,7 @@ class Session:
     "Layer 3: identity + liveness. Layer 2 state hangs off it."
     address: tuple
     session_id: bytes
+    authenticated: bool = False
     last_seen: float = field(default_factory=time.monotonic)
     sender: SenderState = field(default_factory=SenderState)
     receiver: ReceiverState = field(default_factory=ReceiverState)
@@ -331,9 +332,14 @@ def dispatch_datagram(address: tuple, datagram: Datagram) -> None:
     # RDTType.HEARTBEAT: refreshing last_seen above is all it needs.
 
 # Layer 4: Application
+ACCOUNTS = {
+    "alice": "alice123",
+    "bob": "bob123",
+    "charlie": "charlie123",
+    "doug": "doug123",
+}
 
 # Client registry: who is online, by username. Layer 3 only knows sessions.
-# Usernames are an application idea, so they live here.
 clients: dict[str, Session] = {}     # username -> session
 client_names: dict[tuple, str] = {}  # session key -> username
 guest_counter = 0
@@ -378,21 +384,11 @@ def get_connected_users() -> list[str]:
     return list(clients)
 
 def on_session_opened(session: Session) -> None:
-    username = register_client(session)
-
-    current_peers = [
-        peer for peer in get_connected_users()
-        if peer != username
-    ]
-
-    send_reliable(
-        session,
-        MessageType.USER_LIST,
-        EVENT_REQ_ID,
-        {"users": current_peers},
+    "A transport session has opened, but is not authenticated yet."
+    print(
+        f"[AUTH REQUIRED] {session.address} "
+        f"| session={session.session_id.hex()[:8]}"
     )
-
-    notify_users(MessageType.USER_JOIN, {"username": username}, exclude=session)
 
 def on_session_closed(session: Session, reason: str) -> None:
     username = unregister_client(session)
@@ -588,23 +584,147 @@ def handle_direct(session: Session, datagram: Datagram) -> None:
         },
     )
 
+def handle_auth(session: Session, datagram: Datagram) -> None:
+    "Authenticate a provisional session and register it on success."
+    req_id = datagram.app.req_id
+    payload = datagram.payload
+
+    # Authentication is allowed only once per session.
+    if session.authenticated:
+        send_reliable(
+            session,
+            MessageType.ERROR,
+            req_id,
+            {
+                "code": 409,
+                "message": "Session is already authenticated",
+            },
+        )
+        return
+
+    username = payload.get("username")
+    password = payload.get("password")
+
+    if (
+        not isinstance(username, str)
+        or not username.strip()
+        or not isinstance(password, str)
+        or not password
+        or ACCOUNTS.get(username) != password
+    ):
+        print(f"[AUTH FAILED] Invalid credentials | {session.address}")
+
+        send_reliable(
+            session,
+            MessageType.ERROR,
+            req_id,
+            {
+                "code": 401,
+                "message": "Invalid username or password",
+            },
+        )
+
+        remove_session(session, "authentication failed")
+        return
+
+    username = username.strip()
+
+    if username in clients:
+        print(f"[AUTH FAILED] Account already connected: {username}")
+
+        send_reliable(
+            session,
+            MessageType.ERROR,
+            req_id,
+            {
+                "code": 409,
+                "message": "Account already connected",
+            },
+        )
+
+        remove_session(session, "account already connected")
+        return
+
+    # 3. Register the user only after credential validation.
+    session.authenticated = True
+    clients[username] = session
+    client_names[session_key(session)] = username
+
+    current_peers = [
+        peer for peer in get_connected_users()
+        if peer != username
+    ]
+
+    print(f"[AUTH OK] {username} | {session.address}")
+    print(f"[ONLINE] {get_connected_users()}")
+
+    # 4. Queue AUTH_OK first.
+    send_reliable(
+        session,
+        MessageType.AUTH_OK,
+        req_id,
+        {
+            "username": username,
+            "message": "Authentication successful",
+        },
+    )
+
+    send_reliable(
+        session,
+        MessageType.USER_LIST,
+        EVENT_REQ_ID,
+        {"users": current_peers},
+    )
+
+    notify_users(
+        MessageType.USER_JOIN,
+        {"username": username},
+        exclude=session,
+    )
+
 # Add new message types here (broadcast, direct, file transfer, ...).
 MESSAGE_HANDLERS = {
+    MessageType.AUTH: handle_auth,
     MessageType.PING: handle_ping,
     MessageType.MSG_BROADCAST: handle_broadcast,
     MessageType.MSG_DIRECT: handle_direct,
 }
 
 def dispatch_message(session: Session, datagram: Datagram) -> None:
-    "Called by layer 2 for each new DATA message; routes it by app type."
-    if datagram.payload is None:
-        print(f"[REJECTED DATA] Missing payload from {session.address}")
+    "Route application messages, enforcing authentication first."
+    if datagram.app is None or datagram.payload is None:
+        print(f"[REJECTED DATA] Missing application data from {session.address}")
         return
 
-    handler = MESSAGE_HANDLERS.get(datagram.app.type)
+    msg_type = datagram.app.type
+
+    # Provisional sessions may submit AUTH only.
+    if not session.authenticated and msg_type != MessageType.AUTH:
+        print(
+            f"[REJECTED UNAUTHENTICATED] {session.address} "
+            f"| type={msg_type}"
+        )
+
+        send_reliable(
+            session,
+            MessageType.ERROR,
+            datagram.app.req_id,
+            {
+                "code": 401,
+                "message": "Authentication required",
+            },
+        )
+
+        remove_session(session, "application request before authentication")
+        return
+
+    handler = MESSAGE_HANDLERS.get(msg_type)
 
     if handler is None:
-        print(f"[UNSUPPORTED APP TYPE] {datagram.app.type} from {session.address}")
+        print(
+            f"[UNSUPPORTED APP TYPE] {msg_type} "
+            f"from {session.address}"
+        )
         return
 
     handler(session, datagram)
@@ -648,7 +768,6 @@ def run_server() -> None:
 
     finally:
         sock.close()
-
 
 if __name__ == "__main__":
     run_server()

@@ -467,6 +467,35 @@ def run() -> None:
     try:
         if not open_session():
             return
+
+        username = input("Username: ").strip()
+        password = input("Password: ")
+
+        response = send_request(
+            MessageType.AUTH,
+            {
+                "username": username,
+                "password": password,
+            },
+        )
+
+        if response is None:
+            log("[AUTH FAILED] No application response")
+            return
+
+        if response.app.type == MessageType.ERROR:
+            log(f"[AUTH FAILED] {response.payload}")
+            return
+
+        if response.app.type != MessageType.AUTH_OK:
+            log(
+                f"[AUTH FAILED] Unexpected response "
+                f"type={response.app.type} "
+                f"| payload={response.payload}"
+            )
+            return
+
+        log(f"[AUTH OK] {response.payload}")
  
         while True:
             command = input(
