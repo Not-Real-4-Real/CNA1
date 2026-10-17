@@ -1,5 +1,8 @@
 import socket
 import time
+import base64
+import binascii
+from pathlib import Path
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -344,6 +347,22 @@ clients: dict[str, Session] = {}     # username -> session
 client_names: dict[tuple, str] = {}  # session key -> username
 guest_counter = 0
 
+FILE_CHUNK_SIZE = 600
+RECEIVED_DIR = Path("received_files")
+
+@dataclass
+class FileTransfer:
+    transfer_id: int
+    filename: str
+    expected_size: int
+
+    chunks: list[bytes] = field(default_factory=list)
+    next_chunk_index: int = 0
+    received_size: int = 0
+
+# Key: (session_key, transfer_id)
+file_transfers: dict[tuple, FileTransfer] = {}
+
 def register_client(session: Session) -> str:
     "Assign a temporary username and store the connection."
     global guest_counter
@@ -372,6 +391,7 @@ def unregister_client(session: Session) -> str | None:
     return username
 
 EVENT_REQ_ID = 0
+
 def notify_users(msg_type: int, payload: dict, exclude: Session | None = None) -> None:
     "Send a one-way event to every registered client (optionally skipping one)."
     for session in list(clients.values()):
@@ -391,6 +411,22 @@ def on_session_opened(session: Session) -> None:
     )
 
 def on_session_closed(session: Session, reason: str) -> None:
+    # Discard incomplete file transfers belonging to this session.
+    session_prefix = session_key(session)
+
+    stale_transfers = [
+        key
+        for key in file_transfers
+        if key[0] == session_prefix
+    ]
+
+    for key in stale_transfers:
+        transfer = file_transfers.pop(key)
+        print(
+            f"[FILE TRANSFER ABORTED] {transfer.filename} "
+            f"| reason={reason}"
+        )
+
     username = unregister_client(session)
  
     # The leaver is already out of the registry, so only the others are told.
@@ -526,8 +562,7 @@ def handle_direct(session: Session, datagram: Datagram) -> None:
         return
 
     receiver_username = receiver_username.strip()
-    
-    # 2. Identify the sender.
+
     sender_username = client_names.get(session_key(session))
 
     if sender_username is None:
@@ -573,7 +608,6 @@ def handle_direct(session: Session, datagram: Datagram) -> None:
         f"[DIRECT QUEUED] {sender_username} -> {receiver_username}"
     )
 
-    # 6. Confirm application-level acceptance to the sender.
     send_reliable(
         session,
         MessageType.MSG_SENT,
@@ -682,12 +716,306 @@ def handle_auth(session: Session, datagram: Datagram) -> None:
         exclude=session,
     )
 
+def handle_file_offer(session: Session, datagram: Datagram) -> None:
+    "Validate a client's file offer and accept it for transfer."
+    req_id = datagram.app.req_id
+    payload = datagram.payload
+
+    transfer_id = payload.get("transfer_id")
+    filename = payload.get("filename")
+    file_size = payload.get("size")
+
+    if (
+        not isinstance(transfer_id, str)
+        or len(transfer_id) != 32
+        or any(c not in "0123456789abcdef" for c in transfer_id)
+    ):
+        send_reliable(
+            session, MessageType.ERROR, req_id,
+            {"code": 400, "message": "Invalid transfer ID"},
+        )
+        return
+
+    if (
+        not isinstance(filename, str)
+        or not filename.strip()
+        or filename in {".", ".."}
+        or "/" in filename
+        or "\\" in filename
+    ):
+        send_reliable(
+            session,
+            MessageType.ERROR,
+            req_id,
+            {
+                "code": 400,
+                "message": "Invalid filename",
+            },
+        )
+        return
+
+    if (
+        not isinstance(file_size, int)
+        or isinstance(file_size, bool)
+        or file_size < 0
+    ):
+        send_reliable(
+            session,
+            MessageType.ERROR,
+            req_id,
+            {
+                "code": 400,
+                "message": "File size must be a non-negative integer",
+            },
+        )
+        return
+
+    sender_username = client_names.get(session_key(session))
+
+    if sender_username is None:
+        send_reliable(
+            session,
+            MessageType.ERROR,
+            req_id,
+            {
+                "code": 401,
+                "message": "Sender is not registered",
+            },
+        )
+        return
+
+    key = (session_key(session), transfer_id)
+
+    if key in file_transfers:
+        send_reliable(
+            session, MessageType.ERROR, req_id,
+            {"code": 409, "message": "Transfer ID already exists"},
+        )
+        return
+
+    file_transfers[key] = FileTransfer(
+        transfer_id=transfer_id,
+        filename=filename,
+        expected_size=file_size,
+    )
+
+    print(
+        f"[FILE OFFER] sender={sender_username} "
+        f"| transfer={transfer_id[:8]} "
+        f"| filename={filename} | size={file_size} bytes"
+    )
+        
+    send_reliable(
+        session,
+        MessageType.FILE_ACCEPT,
+        req_id,
+        {
+            "filename": filename,
+            "size": file_size,
+            "message": "File offer accepted",
+        },
+    )
+
+def handle_file_data(session: Session, datagram: Datagram) -> None:
+    "Validate and buffer one chunk of an active file transfer."
+    payload = datagram.payload
+
+    transfer_id = payload.get("transfer_id")
+    chunk_index = payload.get("chunk_index")
+    encoded_data = payload.get("data")
+
+    if not isinstance(transfer_id, str):
+        print("[FILE DATA REJECTED] Missing transfer ID")
+        return
+
+    key = (session_key(session), transfer_id)
+    transfer = file_transfers.get(key)
+
+    if transfer is None:
+        print(
+            f"[FILE DATA REJECTED] Unknown transfer "
+            f"{transfer_id[:8]}"
+        )
+        return
+
+    if (
+        not isinstance(chunk_index, int)
+        or isinstance(chunk_index, bool)
+        or chunk_index != transfer.next_chunk_index
+    ):
+        print(
+            f"[FILE DATA REJECTED] Unexpected chunk index "
+            f"| expected={transfer.next_chunk_index} "
+            f"| received={chunk_index}"
+        )
+        file_transfers.pop(key, None)
+        return
+
+    if not isinstance(encoded_data, str):
+        print("[FILE DATA REJECTED] Chunk data must be a string")
+        file_transfers.pop(key, None)
+        return
+
+    # Decode the Base64 text back into the original file bytes.
+    try: 
+        chunk = base64.b64decode(encoded_data, validate=True)
+    except (binascii.Error, ValueError):
+        print("[FILE DATA REJECTED] Invalid Base64")
+        file_transfers.pop(key, None)
+        return
+
+    # A chunk must not exceed the client's configured chunk size.
+    if len(chunk) > FILE_CHUNK_SIZE:
+        print("[FILE DATA REJECTED] Chunk exceeds maximum size")
+        file_transfers.pop(key, None)
+        return
+
+    # Never accept more bytes than the original offer declared.
+    if transfer.received_size + len(chunk) > transfer.expected_size:
+        print("[FILE DATA REJECTED] Received size exceeds offer")
+        file_transfers.pop(key, None)
+        return
+
+    transfer.chunks.append(chunk)
+    transfer.received_size += len(chunk)
+    transfer.next_chunk_index += 1
+
+    print(
+        f"[FILE CHUNK RECEIVED] {transfer.filename} "
+        f"| chunk={chunk_index} "
+        f"| received={transfer.received_size}/"
+        f"{transfer.expected_size} bytes"
+    )
+
+def handle_file_end(session: Session, datagram: Datagram) -> None:
+    req_id = datagram.app.req_id
+    payload = datagram.payload
+
+    transfer_id = payload.get("transfer_id")
+    total_chunks = payload.get("total_chunks")
+    declared_size = payload.get("size")
+
+    if not isinstance(transfer_id, str):
+        send_reliable(
+            session, MessageType.ERROR, req_id,
+            {"code": 400, "message": "Missing transfer ID"},
+        )
+        return
+
+    key = (session_key(session), transfer_id)
+    transfer = file_transfers.get(key)
+
+    if transfer is None:
+        send_reliable(
+            session, MessageType.ERROR, req_id,
+            {"code": 404, "message": "Transfer not found or invalid"},
+        )
+        return
+
+    # Validate the final metadata.
+    if (
+        not isinstance(total_chunks, int)
+        or isinstance(total_chunks, bool)
+        or total_chunks < 0
+        or not isinstance(declared_size, int)
+        or isinstance(declared_size, bool)
+        or declared_size < 0
+    ):
+        file_transfers.pop(key, None)
+        send_reliable(
+            session, MessageType.ERROR, req_id,
+            {"code": 400, "message": "Invalid FILE_END metadata"},
+        )
+        return
+
+    if (
+        total_chunks != transfer.next_chunk_index
+        or declared_size != transfer.expected_size
+        or transfer.received_size != transfer.expected_size
+    ):
+        print(
+            f"[FILE TRANSFER FAILED] Metadata mismatch "
+            f"| filename={transfer.filename} "
+            f"| chunks={transfer.next_chunk_index}/{total_chunks} "
+            f"| bytes={transfer.received_size}/"
+            f"{transfer.expected_size}"
+        )
+
+        file_transfers.pop(key, None)
+
+        send_reliable(
+            session, MessageType.ERROR, req_id,
+            {"code": 400, "message": "Incomplete or inconsistent file"},
+        )
+        return
+
+    file_bytes = b"".join(transfer.chunks)
+
+    # Save only into the designated receiving directory.
+    try:
+        RECEIVED_DIR.mkdir(parents=True, exist_ok=True)
+        destination = RECEIVED_DIR / transfer.filename
+
+        # Avoid silently overwriting an existing file.
+        with destination.open("xb") as output:
+            output.write(file_bytes)
+
+    except FileExistsError:
+        file_transfers.pop(key, None)
+
+        send_reliable(
+            session, MessageType.ERROR, req_id,
+            {
+                "code": 409,
+                "message": "A file with that name already exists",
+            },
+        )
+        return
+
+    except OSError as error:
+        print(f"[FILE SAVE FAILED] {error}")
+        file_transfers.pop(key, None)
+
+        send_reliable(
+            session, MessageType.FILE_RESULT, req_id,
+            {
+                "transfer_id": transfer_id,
+                "success": False,
+                "filename": transfer.filename,
+                "message": "Server could not save the file",
+            },
+        )
+        return
+
+    file_transfers.pop(key, None)
+
+    print(
+        f"[FILE SAVED] {destination} "
+        f"| size={len(file_bytes)} bytes"
+    )
+
+    send_reliable(
+        session,
+        MessageType.FILE_RESULT,
+        req_id,
+        {
+            "transfer_id": transfer_id,
+            "success": True,
+            "filename": transfer.filename,
+            "size": len(file_bytes),
+            "message": "File received and saved",
+        },
+    )
+
 # Add new message types here (broadcast, direct, file transfer, ...).
 MESSAGE_HANDLERS = {
     MessageType.AUTH: handle_auth,
     MessageType.PING: handle_ping,
     MessageType.MSG_BROADCAST: handle_broadcast,
     MessageType.MSG_DIRECT: handle_direct,
+    MessageType.FILE_OFFER: handle_file_offer,
+    MessageType.FILE_DATA: handle_file_data,
+    MessageType.FILE_END: handle_file_end,
 }
 
 def dispatch_message(session: Session, datagram: Datagram) -> None:

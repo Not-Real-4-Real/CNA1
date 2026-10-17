@@ -48,6 +48,12 @@ class MessageType:
     PONG = 15
     LOGOUT = 16
 
+    FILE_OFFER = 17
+    FILE_ACCEPT = 18
+    FILE_DATA = 19
+    FILE_END = 20
+    FILE_RESULT = 21
+
 # Application header flags
 FLAG_NONE = 0
 FLAG_ENCRYPTED = 1 << 0

@@ -2,7 +2,11 @@ import queue
 import secrets
 import socket
 import threading
- 
+import base64
+import uuid
+import time
+from pathlib import Path
+
 from udp_protocol import *
 
 SERVER_HOST = "127.0.0.1"
@@ -16,6 +20,8 @@ MAX_RETRANSMISSIONS = 5
 RESPONSE_TIMEOUT = RETRANSMISSION_TIMEOUT * (MAX_RETRANSMISSIONS + 3)
 
 HEARTBEAT_INTERVAL = 10.0
+
+FILE_CHUNK_SIZE = 600 
 
 session_id = secrets.token_bytes(16)
  
@@ -461,6 +467,142 @@ def direct(recipient: str, message: str) -> bool:
     log(f"[DIRECT ACCEPTED] {response.payload}")
     return True
 
+def read_file(file_path: str) -> tuple[str, bytes]:
+    path = Path(file_path)
+
+    if not path.is_file():
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    filename = path.name
+    file_bytes = path.read_bytes()
+
+    return filename, file_bytes
+
+def prepare_file(file_path: str):
+    filename, file_bytes = read_file(file_path=file_path)
+
+    return {
+        "filename": filename,
+        "size": len(file_bytes),
+        "data": file_bytes
+    }
+
+def offer_file(file_path: str):
+    try:
+        file_info = prepare_file(file_path)
+    except (FileNotFoundError, OSError) as exc:
+        log(f"[FILE ERROR] {exc}")
+        return None
+
+    transfer_id = uuid.uuid4().hex
+
+    # Step 1: Offer the file.
+    response = send_request(
+        MessageType.FILE_OFFER,
+        {
+            "transfer_id": transfer_id,
+            "filename": file_info["filename"],
+            "size": file_info["size"],
+        },
+    )
+
+    if response is None:
+        log("[FILE OFFER FAILED] No application response")
+        return None
+
+    if response.app.type == MessageType.ERROR:
+        log(f"[FILE OFFER REJECTED] {response.payload}")
+        return None
+
+    if response.app.type != MessageType.FILE_ACCEPT:
+        log(
+            f"[FILE OFFER FAILED] Unexpected response "
+            f"type={response.app.type} | payload={response.payload}"
+        )
+        return None
+
+    log(f"[FILE ACCEPTED] {response.payload}")
+
+    # Step 2: Split the file into chunks.
+    file_bytes = file_info["data"]
+
+    total_chunks = (
+        len(file_bytes) + FILE_CHUNK_SIZE - 1
+    ) // FILE_CHUNK_SIZE
+
+    log(
+        f"[FILE TRANSFER STARTED] {file_info['filename']} "
+        f"| size={len(file_bytes)} bytes "
+        f"| chunks={total_chunks}"
+    )
+
+    for chunk_index, offset in enumerate(range(0, len(file_bytes), FILE_CHUNK_SIZE)):
+        # Inside the FILE_DATA chunk loop, after send_reliable succeeds:
+        # time.sleep(0.5)
+        
+        chunk = file_bytes[offset:offset + FILE_CHUNK_SIZE]
+
+        encoded_chunk = base64.b64encode(chunk).decode("ascii")
+
+        payload = {
+            "transfer_id": transfer_id,
+            "chunk_index": chunk_index,
+            "data": encoded_chunk,
+        }
+
+        log(
+            f"[FILE CHUNK SENDING] "
+            f"{chunk_index + 1}/{total_chunks} "
+            f"| raw_bytes={len(chunk)}"
+        )
+
+        if not send_reliable(
+            MessageType.FILE_DATA,
+            EVENT_REQ_ID,
+            payload,
+        ):
+            log(
+                f"[FILE TRANSFER FAILED] "
+                f"Could not deliver chunk {chunk_index}"
+            )
+            return None
+
+    # Step 4: Tell the server that all chunks have been sent.
+    response = send_request(
+        MessageType.FILE_END,
+        {
+            "transfer_id": transfer_id,
+            "total_chunks": total_chunks,
+            "size": len(file_bytes),
+        },
+    )
+
+    if response is None:
+        log("[FILE TRANSFER FAILED] No final application response")
+        return None
+
+    if response.app.type == MessageType.ERROR:
+        log(f"[FILE TRANSFER FAILED] {response.payload}")
+        return None
+
+    if response.app.type != MessageType.FILE_RESULT:
+        log(
+            f"[FILE TRANSFER FAILED] Unexpected response "
+            f"type={response.app.type} | payload={response.payload}"
+        )
+        return None
+
+    if response.payload.get("success") is not True:
+        log(f"[FILE TRANSFER FAILED] {response.payload}")
+        return None
+
+    log(
+        f"[FILE TRANSFER COMPLETE] "
+        f"{file_info['filename']} | {len(file_bytes)} bytes"
+    )
+
+    return file_info
+
 def run() -> None:
     receiver_thread.start()
  
@@ -499,7 +641,7 @@ def run() -> None:
  
         while True:
             command = input(
-                "\nCommands: 'peers', 'ping', 'broadcast', 'direct', 'quit': "
+                "\nCommands: 'peers', 'ping', 'broadcast', 'direct', 'upload', 'quit': "
             ).strip().lower()
 
             if command == "quit":
@@ -523,6 +665,21 @@ def run() -> None:
                 recipient = input("Recipient username: ").strip()
                 message = input("Direct message: ").strip()
                 direct(recipient, message)
+
+            elif command == 'upload':
+                file_path = input("File path: ").strip()
+
+                if not file_path:
+                    log("[FILE ERROR] File path cannot be empty")
+                    continue
+
+                file_info = offer_file(file_path)
+
+                if file_info is not None:
+                    log(
+                        f"[FILE READY] {file_info['filename']} "
+                        f"| {file_info['size']} bytes"
+                    )
 
             else:
                 log("Unknown command.")
