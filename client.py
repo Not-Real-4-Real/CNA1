@@ -603,6 +603,30 @@ def offer_file(file_path: str):
 
     return file_info
 
+def filesend(recipient: str, filename: str) -> bool:
+    response = send_request(
+        MessageType.FILE_SEND,
+        {
+            "to": recipient,
+            "filename": filename,
+        },
+    )
+
+    if response is None:
+        print("[FILESEND FAILED] No server response")
+        return False
+
+    if response.app.type == MessageType.ERROR:
+        print(f"[FILESEND FAILED] {response.payload}")
+        return False
+
+    if response.app.type != MessageType.MSG_SENT:
+        print(f"[FILESEND FAILED] Unexpected response: {response.payload}")
+        return False
+
+    print(f"[FILESEND ACCEPTED] {response.payload}")
+    return True
+
 def run() -> None:
     receiver_thread.start()
  
@@ -680,6 +704,12 @@ def run() -> None:
                         f"[FILE READY] {file_info['filename']} "
                         f"| {file_info['size']} bytes"
                     )
+
+            elif command == 'sendfile':
+                recipient = input("Recipient username: ").strip()
+                file_path = input("File path: ").strip()
+
+                filesend(recipient=recipient, filename=file_path)
 
             else:
                 log("Unknown command.")

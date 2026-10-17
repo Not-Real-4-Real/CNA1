@@ -363,6 +363,9 @@ class FileTransfer:
 # Key: (session_key, transfer_id)
 file_transfers: dict[tuple, FileTransfer] = {}
 
+# Key: (owner username, stored filename)
+stored_files: dict[tuple[str, str], Path] = {}
+
 def register_client(session: Session) -> str:
     "Assign a temporary username and store the connection."
     global guest_counter
@@ -989,6 +992,10 @@ def handle_file_end(session: Session, datagram: Datagram) -> None:
 
     file_transfers.pop(key, None)
 
+    owner = client_names.get(session_key(session))
+
+    stored_files[(owner, transfer.filename)] = destination
+
     print(
         f"[FILE SAVED] {destination} "
         f"| size={len(file_bytes)} bytes"
@@ -1007,6 +1014,163 @@ def handle_file_end(session: Session, datagram: Datagram) -> None:
         },
     )
 
+def handle_file_send(session: Session, datagram: Datagram) -> None:
+    "Send a file already uploaded by this user to another online user."
+    req_id = datagram.app.req_id
+    payload = datagram.payload
+
+    sender_username = client_names.get(session_key(session))
+    recipient_username = payload.get("to")
+    filename = payload.get("filename")
+
+    if sender_username is None or not session.authenticated:
+        send_reliable(
+            session,
+            MessageType.ERROR,
+            req_id,
+            {
+                "code": 401,
+                "message": "Authentication required",
+            },
+        )
+        return
+
+    if (
+        not isinstance(recipient_username, str)
+        or not recipient_username.strip()
+        or not isinstance(filename, str)
+        or not filename.strip()
+        or filename in {".", ".."}
+        or "/" in filename
+        or "\\" in filename
+    ):
+        send_reliable(
+            session,
+            MessageType.ERROR,
+            req_id,
+            {
+                "code": 400,
+                "message": "Invalid receipient or filename",
+            },
+        )
+        return
+
+    recipient_username = recipient_username.strip()
+    recipient_session = clients.get(recipient_username)
+
+    if recipient_session is None or not recipient_session.authenticated:
+        send_reliable(
+            session,
+            MessageType.ERROR,
+            req_id,
+            {
+                "code": 404,
+                "message": f"User '{recipient_username}' is not online",
+            },
+        )
+        return
+
+    file_path = stored_files.get((sender_username, filename))
+
+    if file_path is None or not file_path.is_file():
+        send_reliable(
+            session,
+            MessageType.ERROR,
+            req_id,
+            {
+                "code": 404,
+                "message": f"Uploaded file '{filename}' was not found",
+            },
+        )
+        return
+
+    transfer_id = __import__("uuid").uuid4().hex
+
+    try:
+        file_size = file_path.stat().st_size
+
+        # Queue the unsolicited offer to B.
+        send_reliable(
+            recipient_session,
+            MessageType.FILE_OFFER,
+            EVENT_REQ_ID,
+            {
+                "transfer_id": transfer_id,
+                "filename": filename,
+                "size": file_size,
+                "from": sender_username,
+            },
+        )
+
+        # Queue the file chunks in order.
+        total_chunks = 0
+
+        with file_path.open("rb") as file:
+            while True:
+                chunk = file.read(FILE_CHUNK_SIZE)
+
+                if not chunk:
+                    break
+
+                send_reliable(
+                    recipient_session,
+                    MessageType.FILE_DATA,
+                    EVENT_REQ_ID,
+                    {
+                        "transfer_id": transfer_id,
+                        "chunk_index": total_chunks,
+                        "data": base64.b64encode(chunk).decode("ascii"),
+                    },
+                )
+
+                total_chunks += 1
+
+        # Queue the end marker after all chunks.
+        send_reliable(
+            recipient_session,
+            MessageType.FILE_END,
+            EVENT_REQ_ID,
+            {
+                "transfer_id": transfer_id,
+                "total_chunks": total_chunks,
+                "size": file_size,
+            },
+        )
+
+    except OSError as error:
+        print(f"[FILE SEND ERROR] {filename}: {error}")
+
+        send_reliable(
+            session,
+            MessageType.ERROR,
+            req_id,
+            {
+                "code": 500,
+                "message": "Could not read the stored file",
+            },
+        )
+        return
+
+    # Tell sender that the server accepted the delivery request.
+    send_reliable(
+        session,
+        MessageType.FILE_SENT,
+        req_id,
+        {
+            "message": "File delivery queued",
+            "recipient": recipient_username,
+            "filename": filename,
+            "transfer_id": transfer_id,
+            "size": file_size,
+        },
+    )
+
+    print(
+        f"[FILE SEND QUEUED] {sender_username} -> {recipient_username} "
+        f"| file={filename} | size={file_size} "
+        f"| chunks={total_chunks} | transfer={transfer_id[:8]}"
+    )
+
 # Add new message types here (broadcast, direct, file transfer, ...).
 MESSAGE_HANDLERS = {
     MessageType.AUTH: handle_auth,
@@ -1016,6 +1180,7 @@ MESSAGE_HANDLERS = {
     MessageType.FILE_OFFER: handle_file_offer,
     MessageType.FILE_DATA: handle_file_data,
     MessageType.FILE_END: handle_file_end,
+    MessageType.FILE_SEND: handle_file_send,
 }
 
 def dispatch_message(session: Session, datagram: Datagram) -> None:

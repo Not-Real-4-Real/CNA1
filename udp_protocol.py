@@ -54,6 +54,9 @@ class MessageType:
     FILE_END = 20
     FILE_RESULT = 21
 
+    FILE_SEND = 22
+    FILE_SENT = 23
+
 # Application header flags
 FLAG_NONE = 0
 FLAG_ENCRYPTED = 1 << 0
