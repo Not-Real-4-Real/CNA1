@@ -3,9 +3,11 @@ import secrets
 import socket
 import threading
 import base64
+import binascii
 import uuid
 import time
 from pathlib import Path
+from dataclasses import dataclass, field
 
 from udp_protocol import *
 
@@ -56,6 +58,21 @@ req_id_lock = threading.Lock()
 EVENT_REQ_ID = 0                  # one-way server events carry req_id 0
 peers = set()                     # usernames of other connected users
 peers_lock = threading.Lock()
+
+# File receiving
+RECEIVED_DIR = Path("client_received_files")
+
+@dataclass
+class FileTransfer:
+    transfer_id: str
+    filename: str
+    expected_size: int
+    chunks: list[bytes] = field(default_factory=list)
+    next_chunk_index: int = 0
+    received_size: int = 0
+
+incoming_transfers: dict[str, FileTransfer] = {}
+incoming_transfers_lock = threading.Lock()
 
 # Printing
 print_lock = threading.Lock()
@@ -320,11 +337,186 @@ def handle_server_event(datagram) -> None:
         message = payload.get("message", "")
         log(f"\n[DELIVER] {sender}: {message}")
 
+    elif msg_type == MessageType.FILE_OFFER:
+        handle_incoming_file_offer(payload)
+
+    elif msg_type == MessageType.FILE_DATA:
+        handle_incoming_file_data(payload)
+
+    elif msg_type == MessageType.FILE_END:
+        handle_incoming_file_end(payload)
+
     else:
         log(
             f"\n[SERVER EVENT] type={msg_type} "
             f"| payload={payload}"
         )
+
+def handle_incoming_file_offer(payload: dict) -> None:
+    transfer_id = payload.get("transfer_id")
+    filename = payload.get("filename")
+    size = payload.get("size")
+    sender = payload.get("from", "Unknown")
+
+    if (
+        not isinstance(transfer_id, str)
+        or len(transfer_id) != 32
+        or not isinstance(filename, str)
+        or not filename
+        or filename in {".", ".."}
+        or "/" in filename
+        or "\\" in filename
+        or not isinstance(size, int)
+        or isinstance(size, bool)
+        or size < 0
+    ):
+        log("[FILE OFFER REJECTED] Invalid offer payload")
+        return
+
+    with incoming_transfers_lock:
+        if transfer_id in incoming_transfers:
+            log(f"[FILE OFFER IGNORED] Duplicate transfer={transfer_id[:8]}")
+            return
+
+        incoming_transfers[transfer_id] = FileTransfer(
+            transfer_id=transfer_id,
+            filename=filename,
+            expected_size=size,
+        )
+
+    log(
+        f"\n[INCOMING FILE] From={sender} | filename={filename} "
+        f"| size={size} bytes | transfer={transfer_id[:8]}"
+    )
+
+def handle_incoming_file_data(payload: dict) -> None:
+    transfer_id = payload.get("transfer_id")
+    chunk_index = payload.get("chunk_index")
+    encoded_data = payload.get("data")
+
+    if (
+        not isinstance(transfer_id, str)
+        or not isinstance(chunk_index, int)
+        or isinstance(chunk_index, bool)
+        or not isinstance(encoded_data, str)
+    ):
+        log("[FILE DATA REJECTED] Invalid payload")
+        return
+
+    try:
+        chunk = base64.b64decode(encoded_data, validate=True)
+    except (binascii.Error, ValueError):
+        log("[FILE DATA REJECTED] Invalid Base64 data")
+        return
+
+    if len(chunk) > FILE_CHUNK_SIZE:
+        log("[FILE DATA REJECTED] Chunk exceeds maximum size")
+        return
+
+    with incoming_transfers_lock:
+        transfer = incoming_transfers.get(transfer_id)
+
+        if transfer is None:
+            log(f"[FILE DATA REJECTED] Unknown transfer={transfer_id[:8]}")
+            return
+
+        if chunk_index != transfer.next_chunk_index:
+            log(
+                f"[FILE DATA REJECTED] Expected chunk "
+                f"{transfer.next_chunk_index}, got {chunk_index}"
+            )
+            return
+
+        if transfer.received_size + len(chunk) > transfer.expected_size:
+            log("[FILE DATA REJECTED] Received size exceeds expected size")
+            return
+
+        transfer.chunks.append(chunk)
+        transfer.received_size += len(chunk)
+        transfer.next_chunk_index += 1
+
+        received = transfer.received_size
+        expected = transfer.expected_size
+
+    log(
+        f"[FILE CHUNK RECEIVED] {transfer.filename} "
+        f"| chunk={chunk_index} | bytes={len(chunk)} "
+        f"| progress={received}/{expected}"
+    )
+
+def handle_incoming_file_end(payload: dict) -> None:
+    transfer_id = payload.get("transfer_id")
+    total_chunks = payload.get("total_chunks")
+    total_size = payload.get("size")
+
+    if (
+        not isinstance(transfer_id, str)
+        or not isinstance(total_chunks, int)
+        or isinstance(total_chunks, bool)
+        or not isinstance(total_size, int)
+        or isinstance(total_size, bool)
+    ):
+        log("[FILE END REJECTED] Invalid payload")
+        return
+
+    with incoming_transfers_lock:
+        transfer = incoming_transfers.get(transfer_id)
+
+        if transfer is None:    
+            log(f"[FILE END REJECTED] Unknown transfer={transfer_id[:8]}")
+            return
+
+        if (
+            total_chunks != transfer.next_chunk_index
+            or total_size != transfer.expected_size
+            or transfer.received_size != transfer.expected_size
+        ):
+            incoming_transfers.pop(transfer_id, None)
+            success = False
+            filename = transfer.filename
+            received_size = transfer.received_size
+            error_message = "Incomplete or inconsistent file transfer"
+            file_bytes = None
+        else:
+            filename = transfer.filename
+            received_size = transfer.received_size
+            file_bytes = b"".join(transfer.chunks)
+            incoming_transfers.pop(transfer_id, None)
+            success = True
+            error_message = ""
+
+    if success:
+        try:
+            RECEIVED_DIR.mkdir(parents=True, exist_ok=True)
+            destination = RECEIVED_DIR / filename
+
+            # Do not silently overwrite an existing file.
+            with destination.open("xb") as file:
+                file.write(file_bytes)
+
+        except OSError as error:
+            success = False
+            error_message = str(error)
+
+    result = {
+        "transfer_id": transfer_id,
+        "filename": filename,
+        "success": success,
+        "size": received_size,
+        "message": (
+            "File received successfully"
+            if success
+            else error_message
+        ),
+    }
+
+    if success:
+        log(
+            f"[FILE RECEIVED] {filename} | {received_size} bytes "
+            f"| saved to {RECEIVED_DIR / filename}"
+        )
+    else:
+        log(f"[FILE RECEIVE FAILED] {filename} | {error_message}")
 
 def deliver_response(datagram) -> None:
     "Called by layer 2 for each new DATA message; routes it by req_id."
@@ -620,7 +812,7 @@ def filesend(recipient: str, filename: str) -> bool:
         print(f"[FILESEND FAILED] {response.payload}")
         return False
 
-    if response.app.type != MessageType.MSG_SENT:
+    if response.app.type != MessageType.FILE_SENT:
         print(f"[FILESEND FAILED] Unexpected response: {response.payload}")
         return False
 
@@ -665,7 +857,7 @@ def run() -> None:
  
         while True:
             command = input(
-                "\nCommands: 'peers', 'ping', 'broadcast', 'direct', 'upload', 'quit': "
+                "\nCommands: 'peers', 'ping', 'broadcast', 'direct', 'upload', 'sendfile', 'quit': "
             ).strip().lower()
 
             if command == "quit":

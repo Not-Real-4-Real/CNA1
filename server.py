@@ -2,6 +2,7 @@ import socket
 import time
 import base64
 import binascii
+import uuid
 from pathlib import Path
 from collections import deque
 from dataclasses import dataclass, field
@@ -1084,7 +1085,7 @@ def handle_file_send(session: Session, datagram: Datagram) -> None:
         )
         return
 
-    transfer_id = __import__("uuid").uuid4().hex
+    transfer_id = uuid.uuid4().hex
 
     try:
         file_size = file_path.stat().st_size
