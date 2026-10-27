@@ -33,13 +33,25 @@ sock.settimeout(0.1)
 running = threading.Event()
 running.set()
 
+# Buffer configuration
+DATA_BUFFER_SIZE = 32             # Maximum queued incoming DATA datagrams
+
 # Layer 2 (reliable) state
 send_lock = threading.Lock()      # stop-and-wait: one unACKed DATA at a time
+send_state_lock = threading.Lock()# Protects pending_seq
 send_seq = 0                      # seq of the next DATA we send
 pending_seq = None                # seq we are currently waiting an ACK for
 ack_event = threading.Event()     # set by receiver when the pending DATA is ACKed
 expected_recv_seq = 0             # seq we expect from the server next
- 
+
+# Incoming DATA buffer: consumed by the future handler loop
+incoming_data = queue.Queue(maxsize=DATA_BUFFER_SIZE)
+
+# Server rwnd for flow control
+peer_rwnd = 0
+peer_window_lock = threading.Lock()
+peer_window_condition = threading.Condition()
+
 # Layer 2 -> Layer 4 hook: called with every new (non-duplicate) DATA datagram.
 message_handler = None
  
@@ -55,7 +67,7 @@ pending_requests = {}             # req_id -> Queue for that response
 pending_lock = threading.Lock()
 next_req_id = 1
 req_id_lock = threading.Lock()
-EVENT_REQ_ID = 0                  # one-way server events carry req_id 0
+EVENT_REQ_ID = 0                  # one-way events carry req_id 0
 peers = set()                     # usernames of other connected users
 peers_lock = threading.Lock()
 
@@ -108,32 +120,55 @@ def transport_receive():
 def send_control(packet_type: int, quiet: bool = False) -> None:
     "Send a header-only packet (OPEN / CLOSE / HEARTBEAT)."
     transport_send(
-        encode_datagram(RDTHeader(session_id=session_id, type=packet_type))
+        encode_datagram(
+            RDTHeader(
+                session_id=session_id,
+                rwnd=receive_window(),
+                type=packet_type,
+            )
+        )
     )
     if not quiet:
         log(f"[SENT CONTROL] type={packet_type} | session={session_id.hex()[:8]}")
 
 def send_ack(ack_num: int) -> None:
+    rwnd = receive_window()
     transport_send(
         encode_datagram(
-            RDTHeader(session_id=session_id, ack_num=ack_num, type=RDTType.ACK)
+            RDTHeader(
+                session_id=session_id,
+                ack_num=ack_num,
+                rwnd=rwnd,
+                type=RDTType.ACK,
+            )
         )
     )
-    log(f"[ACK SENT] ack_num={ack_num}")
+    log(f"[ACK SENT] ack_num={ack_num}| rwnd={rwnd}")
 
 def send_reliable(msg_type: int, req_id: int, payload: dict) -> bool:
     global send_seq, pending_seq
  
     with send_lock:
+        with peer_window_condition:
+            while peer_rwnd <= 0:
+                peer_window_condition.wait()
+
         seq = send_seq
         packet = encode_datagram(
-            RDTHeader(session_id=session_id, seq_num=seq, type=RDTType.DATA),
+            RDTHeader(
+                session_id=session_id, 
+                seq_num=seq, 
+                rwnd=receive_window(),
+                type=RDTType.DATA
+            ),
             AppHeader(length=0, type=msg_type, req_id=req_id),
             payload=payload,
         )
  
-        pending_seq = seq
         ack_event.clear()
+
+        with send_state_lock:
+            pending_seq = seq
  
         try:
             for attempt in range(MAX_RETRANSMISSIONS + 1):
@@ -150,35 +185,26 @@ def send_reliable(msg_type: int, req_id: int, payload: dict) -> bool:
             log(f"[TRANSMISSION FAILED] seq={seq} | retries={MAX_RETRANSMISSIONS}")
             return False
         finally:
-            pending_seq = None
+            with send_state_lock:
+                if pending_seq == seq:
+                    pending_seq = None
+
+def receive_window() -> int:
+    return max(0, DATA_BUFFER_SIZE - incoming_data.qsize())
 
 def handle_ack(datagram) -> None:
     ack_num = datagram.rdt.ack_num
-    if pending_seq is not None and ack_num == pending_seq:
-        log(f"[ACK ACCEPTED] ack_num={ack_num}")
-        ack_event.set()
-    else:
-        log(f"[IGNORED ACK] ack_num={ack_num}")
+
+    with send_state_lock:
+        if pending_seq is not None and ack_num == pending_seq:
+            log(f"[ACK ACCEPTED] ack_num={ack_num}")
+            update_peer_window(datagram.rdt.rwnd)
+            ack_event.set()
+        else:
+            log(f"[IGNORED ACK] ack_num={ack_num}")
 
 def handle_data(datagram) -> None:
-    "ACK incoming DATA, drop duplicates, pass new messages upward."
-    global expected_recv_seq
-
-    seq = datagram.rdt.seq_num
-
-    if seq not in (0, 1):
-        log(f"[REJECTED DATA] Invalid seq={seq}")
-        return
-
-    # Always ACK, even duplicates, in case our previous ACK was lost.
-    send_ack(seq)
-
-    if seq != expected_recv_seq:
-        log(f"[DUPLICATE DATA] seq={seq}")
-        return
-
-    expected_recv_seq ^= 1
-
+    "Process an already-accepted DATA datagram at the application layer."
     if datagram.app is None:
         log("[REJECTED DATA] Missing application header")
         return
@@ -192,15 +218,61 @@ def handle_datagram(datagram) -> None:
     packet_type = datagram.rdt.type
  
     if packet_type == RDTType.OPEN_ACK:
-        open_ack_event.set()
+        handle_open_ack(datagram)
     elif packet_type == RDTType.CLOSE_ACK:
         close_ack_event.set()
     elif packet_type == RDTType.ACK:
         handle_ack(datagram)
     elif packet_type == RDTType.DATA:
-        handle_data(datagram)
+        receive_data(datagram)
     else:
         log(f"[IGNORED] Unexpected RDT type={packet_type}")
+
+def receive_data(datagram) -> None:
+    "Accept inbound DATA into the buffer before acknowledging it."
+    global expected_recv_seq
+
+    seq = datagram.rdt.seq_num
+
+    if seq not in (0, 1):
+        log(f"[REJECTED DATA] Invalid seq={seq}")
+        return
+
+    # Always ACK, even duplicates, in case previous ACK was lost.
+    if seq != expected_recv_seq:
+        log(f"[DUPLICATE DATA] seq={seq}")
+        send_ack(seq)
+        return
+
+    # Only acknowledge a new DATA packet after successfully retaining it.
+    try:
+        incoming_data.put_nowait(datagram)
+    except queue.Full:
+        log(
+            f"[RECEIVE BUFFER FULL] seq={seq} | "
+            f"capacity={DATA_BUFFER_SIZE}"
+        )
+        return
+
+    expected_recv_seq ^= 1
+    update_peer_window(datagram.rdt.rwnd)
+    send_ack(seq)
+
+    log(
+        f"[DATA BUFFERED] seq={seq} | "
+        f"queued={incoming_data.qsize()}/{DATA_BUFFER_SIZE}"
+    )
+
+def update_peer_window(rwnd: int) -> None:
+    global peer_rwnd
+
+    with peer_window_condition:
+        peer_rwnd = rwnd
+
+        if peer_rwnd > 0:
+            peer_window_condition.notify_all()
+
+    log(f"[PEER WINDOW] rwnd={rwnd}")
 
 def receiver_loop() -> None:
     while running.is_set():
@@ -216,8 +288,23 @@ def receiver_loop() -> None:
  
         if datagram is not None:          
             handle_datagram(datagram)
+
+def handler_loop() -> None:
+    while running.is_set() or not incoming_data.empty():
+        try:
+            datagram = incoming_data.get(timeout=0.1)
+        except queue.Empty:
+            continue
+
+        try:
+            handle_data(datagram)
+        except Exception as error:
+            log(f"[HANDLER ERROR] {error}")
+        finally:
+            incoming_data.task_done()
  
 receiver_thread = threading.Thread(target=receiver_loop, daemon=True)
+handler_thread = threading.Thread(target=handler_loop,daemon=True)
 
 # Layer 3: Session (OPEN / CLOSE handshakes, heartbeat)
 def control_handshake(packet_type: int, ack_event_: threading.Event, label: str) -> bool:
@@ -271,6 +358,14 @@ def open_session() -> bool:
  
     log("[SESSION FAILED] Server did not answer OPEN")
     return False
+
+def handle_open_ack(datagram) -> None:
+    if established:
+        log("[IGNORED] Unexpected OPEN_ACK")
+        return
+
+    update_peer_window(datagram.rdt.rwnd)
+    open_ack_event.set()
 
 def close_session() -> bool:
     global established
@@ -357,21 +452,6 @@ def handle_incoming_file_offer(payload: dict) -> None:
     filename = payload.get("filename")
     size = payload.get("size")
     sender = payload.get("from", "Unknown")
-
-    if (
-        not isinstance(transfer_id, str)
-        or len(transfer_id) != 32
-        or not isinstance(filename, str)
-        or not filename
-        or filename in {".", ".."}
-        or "/" in filename
-        or "\\" in filename
-        or not isinstance(size, int)
-        or isinstance(size, bool)
-        or size < 0
-    ):
-        log("[FILE OFFER REJECTED] Invalid offer payload")
-        return
 
     with incoming_transfers_lock:
         if transfer_id in incoming_transfers:
@@ -795,7 +875,7 @@ def offer_file(file_path: str):
 
     return file_info
 
-def filesend(recipient: str, filename: str) -> bool:
+def file_send(recipient: str, filename: str) -> bool:
     response = send_request(
         MessageType.FILE_SEND,
         {
@@ -821,6 +901,7 @@ def filesend(recipient: str, filename: str) -> bool:
 
 def run() -> None:
     receiver_thread.start()
+    handler_thread.start()
  
     try:
         if not open_session():
@@ -901,7 +982,7 @@ def run() -> None:
                 recipient = input("Recipient username: ").strip()
                 file_path = input("File path: ").strip()
 
-                filesend(recipient=recipient, filename=file_path)
+                file_send(recipient=recipient, filename=file_path)
 
             else:
                 log("Unknown command.")
@@ -916,7 +997,8 @@ def run() -> None:
 
         finally:
             running.clear()
-            receiver_thread.join(timeout=1.0)
+            receiver_thread.join(timeout = 1.0)
+            handler_thread.join()
             sock.close()
             log("[CLIENT SOCKET CLOSED]")
  

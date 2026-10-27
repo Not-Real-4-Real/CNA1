@@ -2,8 +2,8 @@ import json
 import struct
 from dataclasses import dataclass
 
-RDT_HEADER_FORMAT = "!16sIIBB"
-RDT_HEADER_SIZE = struct.calcsize(RDT_HEADER_FORMAT)  # 26 bytes
+RDT_HEADER_FORMAT = "!16sIIBBB"
+RDT_HEADER_SIZE = struct.calcsize(RDT_HEADER_FORMAT)  # 27 bytes
 
 APP_HEADER_FORMAT = "!IBIB"
 APP_HEADER_SIZE = struct.calcsize(APP_HEADER_FORMAT)  # 10 bytes
@@ -14,7 +14,7 @@ MAX_PAYLOAD_SIZE = (
     MAX_DATAGRAM_SIZE
     - RDT_HEADER_SIZE
     - APP_HEADER_SIZE
-)  # 1164 bytes
+)  # 1163 bytes
 
 class RDTType:
     OPEN = 1
@@ -66,6 +66,7 @@ class RDTHeader:
     session_id: bytes
     seq_num: int = 0
     ack_num: int = 0
+    rwnd: int = 0
     type: int = RDTType.OPEN
     flags: int = 0
 
@@ -88,6 +89,16 @@ class RDTHeader:
                 "ACK number must fit in 4 bytes"
             )
 
+        if not 0 <= self.rwnd <= 0xFF:
+            raise ValueError(
+                "Receive window must fit in 1 byte (0-255)"
+            )
+
+        if not 0 <= self.type <= 0xFF:
+            raise ValueError(
+                "RDT type must fit in 1 byte"
+            )
+
         # Version 1 reserves all transport flag bits.
         if self.flags != 0:
             raise ValueError(
@@ -99,6 +110,7 @@ class RDTHeader:
             self.session_id,
             self.seq_num,
             self.ack_num,
+            self.rwnd,
             self.type,
             self.flags,
         )
@@ -110,14 +122,20 @@ class RDTHeader:
                 f"Expected {RDT_HEADER_SIZE} RDT header bytes, got {len(data)}"
             )
 
-        session_id, seq_num, ack_num, packet_type, flags = (
-            struct.unpack(RDT_HEADER_FORMAT, data)
-        )
+        (
+            session_id,
+            seq_num,
+            ack_num,
+            rwnd,
+            packet_type,
+            flags,
+        ) = struct.unpack(RDT_HEADER_FORMAT, data)
 
         header = cls(
             session_id=session_id,
             seq_num=seq_num,
             ack_num=ack_num,
+            rwnd=rwnd,
             type=packet_type,
             flags=flags,
         )
@@ -182,7 +200,6 @@ class AppHeader:
 
         # Validate the decoded values too.
         header.encode()
-
         return header
 
 @dataclass
