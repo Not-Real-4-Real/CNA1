@@ -1,0 +1,14 @@
+# Byte-compiled / cache files của Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Thư mục lưu file tải lên/nhận về sinh ra trong lúc chạy thử nghiệm
+received_files/
+client_received_files/
+
+# Cấu hình IDE và hệ điều hành
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

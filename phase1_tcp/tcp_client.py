@@ -2,7 +2,7 @@ import socket
 import queue
 import threading
 
-from protocol import MessageType, send_frame, recv_frame
+from CNA1.phase1_tcp.protocol import MessageType, send_frame, recv_frame
 
 # Request ID -> queue for the corresponding response.
 pending_requests = {}
