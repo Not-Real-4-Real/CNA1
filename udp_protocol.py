@@ -9,6 +9,7 @@ APP_HEADER_FORMAT = "!IBIB"
 APP_HEADER_SIZE = struct.calcsize(APP_HEADER_FORMAT)  # 10 bytes
 
 MAX_DATAGRAM_SIZE = 1200
+MAX_RWND = 0xFF
 
 MAX_PAYLOAD_SIZE = (
     MAX_DATAGRAM_SIZE
@@ -24,6 +25,10 @@ class RDTType:
     CLOSE = 5
     CLOSE_ACK = 6
     HEARTBEAT = 7
+
+    # add for responding to probes and window updates
+    WINDOW_PROBE = 8
+    WINDOW_UPDATE = 9
 
 class MessageType:
     HELLO = 1
