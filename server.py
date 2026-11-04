@@ -10,29 +10,38 @@ from collections import deque
 from dataclasses import dataclass, field
 
 from udp_protocol import *
-
+from reliable_support import SentPacket, RTTTracker
+from congestion_control import CubicController
 HOST = "127.0.0.1"
 PORT = 5000
 BUFFER_SIZE = 1201
-
+MAX_RWND= 0xFF
 RETRANSMISSION_TIMEOUT = 1.0   # seconds
 MAX_RETRANSMISSIONS = 5
 HEARTBEAT_TIMEOUT = 30.0        # seconds without valid client activity
-
+message_handler = None
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
 @dataclass
 class SenderState:
     "Layer 2: our outgoing DATA toward one client."
     seq: int = 0                                   # seq of the next DATA to send
+    base: int = 0
     outbox: deque = field(default_factory=deque)   # queued (msg_type, req_id, payload)
 
-    in_flight: bytes | None = None                 # exact bytes awaiting an ACK
-    in_flight_seq: int | None = None
-    sent_at: float | None = None
-    retransmissions: int = 0
-
+    # in_flight: bytes | None = None                 # exact bytes awaiting an ACK
+    in_flight: dict[int, SentPacket] = field(default_factory=dict)
     peer_rwnd: int = 0
+    retransmissions: int = 0
+    dup_acks: int = 0
+    recover: int = 0
+    congestion_controller: CubicController = field(default_factory=CubicController)
+    rtt_tracker: RTTTracker = field(default_factory=RTTTracker)
+    # in_flight_seq: int | None = None
+
+    # cwnd: int = 1
+    # sent_at: float | None = None
+
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 @dataclass
@@ -143,87 +152,147 @@ def send_reliable(session: Session, msg_type: int, req_id: int, payload: dict) -
         print(
             f"[OUTBOX QUEUE] recipient={session.address} "
             f"| type={msg_type} | req_id={req_id} "
-            f"| in_flight={sender.in_flight_seq} "
+            f"| in_flight={sender.in_flight} "
             f"| queued={len(sender.outbox)}"
         )
 
 def pump_outbox(session: Session) -> None:
     "If the channel is idle, transmit the next queued message."
     sender = session.sender
+    cc = sender.congestion_controller
+    # if sender.in_flight is not None:
+    #     return
 
-    if sender.in_flight is not None:
-        return
+    # if not sender.outbox:
+    #     return
 
-    if not sender.outbox:
-        return
+    # if sender.peer_rwnd <= 0:
+    #     return
 
-    if sender.peer_rwnd <= 0:
-        return
+    # msg_type, req_id, payload = sender.outbox.popleft()
 
-    msg_type, req_id, payload = sender.outbox.popleft()
+    # packet = encode_datagram(
+    #     rdt=RDTHeader(
+    #         session_id=session.session_id,
+    #         seq_num=sender.seq,
+    #         rwnd=receive_window(session=session),
+    #         type=RDTType.DATA,
+    #     ),
+    #     app=AppHeader(length=0, type=msg_type, req_id=req_id),
+    #     payload=payload,
+    # )
 
-    packet = encode_datagram(
-        rdt=RDTHeader(
-            session_id=session.session_id,
-            seq_num=sender.seq,
-            rwnd=receive_window(session=session),
-            type=RDTType.DATA,
-        ),
-        app=AppHeader(length=0, type=msg_type, req_id=req_id),
-        payload=payload,
-    )
+    # # Keep the exact bytes so a retransmission is identical.
+    # sender.in_flight = packet
+    # sender.in_flight_seq = sender.seq
+    # sender.sent_at = time.monotonic()
+    # sender.retransmissions = 0
 
-    # Keep the exact bytes so a retransmission is identical.
-    sender.in_flight = packet
-    sender.in_flight_seq = sender.seq
-    sender.sent_at = time.monotonic()
-    sender.retransmissions = 0
+    # transport_send(session.address, packet)
 
-    transport_send(session.address, packet)
+    # print(
+    #     f"[DATA SENT] {session.address} "
+    #     f"| seq={sender.seq} "
 
-    print(
-        f"[DATA SENT] {session.address} "
-        f"| seq={sender.seq} "
-        f"| type={msg_type} "
-        f"| req_id={req_id} "
-        f"| awaiting ACK"
-    )
+    #     f"| type={msg_type} "
+    #     f"| req_id={req_id} "
+    #     f"| awaiting ACK"
+    # )
+    while sender.outbox and (len(sender.in_flight) < min(cc.cwnd, sender.peer_rwnd)):
+        msg_type, req_id, payload = sender.outbox.popleft()
+        seq = sender.seq
+        packet = encode_datagram(
+            rdt = RDTHeader(
+                session_id = session.session_id,
+                seq_num = seq,
+                rwnd = receive_window(session),
+                type = RDTType.DATA
+            ),
+            app = AppHeader(length=0, type=msg_type, req_id=req_id),
+            payload = payload
+        )
+        sender.in_flight[seq] = SentPacket(data=packet, sent_at = time.monotonic())
+        sender.seq += 1
+        transport_send(session.address, packet)
+        print(
+            f"[DATA SENT] {session.address} "
+            f"| in_flight={len(sender.in_flight)} "
+            f"| cwnd={sender.congestion_controller.cwnd} "
+        )
+
+
+def retransmit_in_flight(session: Session) -> None:
+    now = time.monotonic()
+    for pkt in session.sender.in_flight.values():
+        transport_send(session.address, pkt.data)
+        pkt.retries += 1
+        pkt.sent_at = now
 
 def handle_ack(session: Session, datagram: Datagram) -> None:
     "Process an ACK for our in-flight DATA."
     sender = session.sender
+    cc = sender.congestion_controller
     with sender.lock:
         ack_num = datagram.rdt.ack_num
 
-        if sender.in_flight is None:
-            print(
-                f"[UNEXPECTED ACK] {session.address} "
-                f"| ack_num={ack_num} | no outstanding DATA"
-            )
-            return
+        # if sender.in_flight is None:
+        #     print(
+        #         f"[UNEXPECTED ACK] {session.address} "
+        #         f"| ack_num={ack_num} | no outstanding DATA"
+        #     )
+        #     return
 
-        # A stale or unrelated ACK must not clear the in-flight packet.
-        if ack_num != sender.in_flight_seq:
-            print(
-                f"[IGNORED ACK] {session.address} "
-                f"| ack_num={ack_num} | expected={sender.in_flight_seq}"
-            )
-            return
+        # # A stale or unrelated ACK must not clear the in-flight packet.
+        # if ack_num != sender.in_flight_seq:
+        #     print(
+        #         f"[IGNORED ACK] {session.address} "
+        #         f"| ack_num={ack_num} | expected={sender.in_flight_seq}"
+        #     )
+        #     return
 
-        print(
-            f"[ACK ACCEPTED] {session.address} "
-            f"| ack_num={ack_num} | retries={sender.retransmissions}"
-        )
+        # print(
+        #     f"[ACK ACCEPTED] {session.address} "
+        #     f"| ack_num={ack_num} | retries={sender.retransmissions}"
+        # )
+
+        # update_peer_window(session, datagram.rdt.rwnd)
+
+        # sender.in_flight = None
+        # sender.in_flight_seq = None
+        # sender.sent_at = None
+        # sender.retransmissions = 0
+        # sender.seq ^= 1          # alternate 0 -> 1 -> 0 -> ...
+
+        # pump_outbox(session)     # send the next queued message, if any
+
+        if ack_num > sender.seq:
+            print(f"[IGNORED ACK] ack_num={ack_num} > next seq={sender.seq}")
+            return
 
         update_peer_window(session, datagram.rdt.rwnd)
-
-        sender.in_flight = None
-        sender.in_flight_seq = None
-        sender.sent_at = None
-        sender.retransmissions = 0
-        sender.seq ^= 1          # alternate 0 -> 1 -> 0 -> ...
-
-        pump_outbox(session)     # send the next queued message, if any
+        if ack_num > sender.base:
+            now = time.monotonic()
+            for seq in list(sender.in_flight.keys()):
+                if seq >= ack_num: 
+                    continue
+                pkt = sender.in_flight.pop(seq)
+                if pkt.retries == 0 and seq == ack_num -1:
+                    sample = now - pkt.sent_at
+                    sender.rtt_tracker.observe(sample)
+                    cc.update_rtt(sample)
+                cc.on_ack()
+            sender.base = ack_num
+            sender.dup_acks = 0
+            sender.retransmissions = 0
+            print(f"[CWND] t={now:.3f} cwnd={cc.cwnd:.2f} ssthresh={cc.ssthresh:.2f}")
+        elif ack_num == sender.base:
+            sender.dup_acks += 1
+            if sender.dup_acks >= 3 and sender.base >= sender.recover:
+                cc.on_loss()
+                sender.recover = sender.seq
+                retransmit_in_flight(session)
+                print(f"[FAST RETRANSMIT] cwnd={cc.cwnd:.2f} ")
+        pump_outbox(session)
 
 def handle_data(session: Session, datagram: Datagram) -> None:
     "Process a DATA datagram that has already been accepted and ACKed."
@@ -250,89 +319,132 @@ def check_retransmission(session: Session) -> None:
     sender = session.sender
     failed = False
 
+    # with sender.lock:
+    #     if sender.in_flight is None or sender.sent_at is None:
+    #         return
+
+    #     now = time.monotonic()
+
+    #     if now - sender.sent_at < RETRANSMISSION_TIMEOUT:
+    #         return
+
+    #     if sender.retransmissions >= MAX_RETRANSMISSIONS:
+    #         print(
+    #             f"[TRANSMISSION FAILED] {session.address} "
+    #             f"| seq={sender.in_flight_seq} "
+    #             f"| retries={sender.retransmissions}"
+    #         )
+    #         failed = True
+    #     else:
+    #         transport_send(session.address, sender.in_flight)
+    #         sender.retransmissions += 1
+    #         sender.sent_at = now
+
+    #         print(
+    #             f"[RETRANSMIT] {session.address} "
+    #             f"| seq={sender.in_flight_seq} "
+    #             f"| retry={sender.retransmissions}/{MAX_RETRANSMISSIONS}"
+    #         )
+
+    # if failed and failure_handler is not None:
+        # failure_handler(session)
     with sender.lock:
-        if sender.in_flight is None or sender.sent_at is None:
+        if not sender.in_flight:
             return
 
-        now = time.monotonic()
-
-        if now - sender.sent_at < RETRANSMISSION_TIMEOUT:
+        oldest = next(iter(sender.in_flight.values()))
+        rto = max(0.2, sender.rtt_tracker.rto)     # floor: localhost RTT is tiny
+        if time.monotonic() - oldest.sent_at < rto:
             return
 
         if sender.retransmissions >= MAX_RETRANSMISSIONS:
-            print(
-                f"[TRANSMISSION FAILED] {session.address} "
-                f"| seq={sender.in_flight_seq} "
-                f"| retries={sender.retransmissions}"
-            )
+            print(f"[TRANSMISSION FAILED] {session.address} | base={sender.base}")
             failed = True
         else:
-            transport_send(session.address, sender.in_flight)
             sender.retransmissions += 1
-            sender.sent_at = now
-
-            print(
-                f"[RETRANSMIT] {session.address} "
-                f"| seq={sender.in_flight_seq} "
-                f"| retry={sender.retransmissions}/{MAX_RETRANSMISSIONS}"
-            )
+            sender.rtt_tracker.backoff()
+            sender.congestion_controller.on_timeout()
+            sender.recover = sender.seq
+            sender.dup_acks = 0
+            retransmit_in_flight(session)
+            print(f"[TIMEOUT] retry={sender.retransmissions}/{MAX_RETRANSMISSIONS} "
+                  f"| cwnd={sender.congestion_controller.cwnd:.2f}")
 
     if failed and failure_handler is not None:
         failure_handler(session)
 
-def receive_window(session: Session) -> int:
-    """Return the currently available DATA buffer slots."""
-    return max(0, DATA_BUFFER_SIZE - session.incoming_data.qsize())
+##def receive_window(session: Session) -> int:
 
 def receive_data(session: Session, datagram: Datagram) -> None:
     "Admit in-order DATA to this session's buffer before acknowledging it."
+    # receiver = session.receiver
+    # seq = datagram.rdt.seq_num
+
+    # if seq not in (0, 1):
+    #     print(f"[REJECTED DATA] Invalid seq={seq} from {session.address}")
+    #     return
+
+    # # Always ACK, even duplicates, in case previous ACK was lost.
+    # if seq != receiver.expected_seq:
+    #     print(f"[DUPLICATE DATA] {session.address} | seq={seq} | ACK resent")
+    #     send_ack(session, seq)
+    #     return
+
+    # # Queue admission and scheduling must be coordinated with the handler.
+    # with session.queue_lock:
+    #     try:
+    #         session.incoming_data.put_nowait(datagram)
+    #     except queue.Full:
+    #         print(
+    #             f"[RECEIVE BUFFER FULL] {session.address} "
+    #             f"| seq={seq} "
+    #             f"| capacity={DATA_BUFFER_SIZE}"
+    #         )
+    #         return
+
+    #     receiver.expected_seq ^= 1
+
+    #     # Schedule this session only once until its queue is drained.
+    #     if not session.handler_scheduled:
+    #         session.handler_scheduled = True
+    #         ready_sessions.put_nowait(session)
+
+    # sender = session.sender
+    # with sender.lock:
+    #     update_window_and_pump(session, datagram.rdt.rwnd)
+
+    # # Acknowledge only after the DATA has been retained.
+    # send_ack(session, seq)
+
+    # print(
+    #     f"[DATA BUFFERED] {session.address} "
+    #     f"| seq={seq} "
+    #     f"| queued={session.incoming_data.qsize()}/{DATA_BUFFER_SIZE}"
+    # )
     receiver = session.receiver
     seq = datagram.rdt.seq_num
 
-    if seq not in (0, 1):
-        print(f"[REJECTED DATA] Invalid seq={seq} from {session.address}")
+    if seq != receiver.expected_seq:        # duplicate or out of order
+        send_ack(session, receiver.expected_seq)
         return
 
-    # Always ACK, even duplicates, in case previous ACK was lost.
-    if seq != receiver.expected_seq:
-        print(f"[DUPLICATE DATA] {session.address} | seq={seq} | ACK resent")
-        send_ack(session, seq)
-        return
-
-    # Queue admission and scheduling must be coordinated with the handler.
     with session.queue_lock:
         try:
             session.incoming_data.put_nowait(datagram)
         except queue.Full:
-            print(
-                f"[RECEIVE BUFFER FULL] {session.address} "
-                f"| seq={seq} "
-                f"| capacity={DATA_BUFFER_SIZE}"
-            )
+            print(f"[RECEIVE BUFFER FULL] seq={seq}")
             return
-
-        receiver.expected_seq ^= 1
-
-        # Schedule this session only once until its queue is drained.
+        receiver.expected_seq += 1
         if not session.handler_scheduled:
             session.handler_scheduled = True
             ready_sessions.put_nowait(session)
 
-    sender = session.sender
-    with sender.lock:
+    with session.sender.lock:
         update_window_and_pump(session, datagram.rdt.rwnd)
 
-    # Acknowledge only after the DATA has been retained.
-    send_ack(session, seq)
+    send_ack(session, receiver.expected_seq)   # "next seq I expect"
 
-    print(
-        f"[DATA BUFFERED] {session.address} "
-        f"| seq={seq} "
-        f"| queued={session.incoming_data.qsize()}/{DATA_BUFFER_SIZE}"
-    )
-
-def update_peer_window(session, rwnd):
-    session.sender.peer_rwnd = rwnd
+# def update_peer_window(session, rwnd):
 
 def update_window_and_pump(session: Session, rwnd: int) -> None:
     update_peer_window(session, rwnd)
@@ -350,7 +462,7 @@ def dispatch_datagram(address: tuple, datagram: Datagram) -> None:
         handle_close(address, rdt.session_id)
         return
 
-    if rdt.type not in (RDTType.DATA, RDTType.ACK, RDTType.HEARTBEAT):
+    if rdt.type not in (RDTType.DATA, RDTType.ACK, RDTType.HEARTBEAT, RDTType.WINDOW_PROBE, RDTType.WINDOW_UPDATE):
         print(f"[UNEXPECTED DATAGRAM] type={rdt.type} from {address}")
         return
 
@@ -367,6 +479,14 @@ def dispatch_datagram(address: tuple, datagram: Datagram) -> None:
         receive_data(session, datagram)
     elif rdt.type == RDTType.ACK:
         handle_ack(session, datagram)
+    elif rdt.type == RDTType.WINDOW_PROBE:
+        handle_window_probe(session, datagram)
+    elif rdt.type == RDTType.WINDOW_UPDATE:
+        handle_window_update(session, datagram)
+    elif rdt.type == RDTType.HEARTBEAT:
+        session.last_seen = time.monotonic()
+    else:
+        raise RuntimeError(f"Unexpected RDT type {rdt.type}")
     # RDTType.HEARTBEAT: refreshing last_seen above is all it needs.
 
 def handler_loop() -> None:
@@ -429,6 +549,63 @@ def receiver_loop() -> None:
 
         tick()
 
+#PHU code
+
+def receive_window(session: Session) -> int:
+    """Return the server free receive-buffer slots for this session."""
+    return max(0, min(MAX_RWND, session.incoming_data.maxsize - session.incoming_data.qsize()))
+
+def update_peer_window(session: Session, rwnd: int) -> None:
+    """Caller must hold session.sender.lock."""
+    if not 0 <= rwnd <= 255:
+        raise ValueError("Invalid receive window")
+
+    sender = session.sender
+    sender.peer_rwnd = rwnd
+
+    if rwnd > 0:
+        sender.persist_deadline = None
+    
+def send_window_probe(session: Session) -> None:
+    """Ask the peer to advertise its current receive window."""
+    transport_send(
+        session.address,
+        encode_datagram(
+            RDTHeader(
+                session_id=session.session_id,
+                rwnd=receive_window(session),
+                type=RDTType.WINDOW_PROBE,
+            )
+        ),
+    )
+
+def send_window_update(session: Session) -> None:
+    """Advertise our current receive capacity without ACKing DATA."""
+    transport_send(
+        session.address,
+        encode_datagram(
+            RDTHeader(
+                session_id=session.session_id,
+                rwnd=receive_window(session),
+                type=RDTType.WINDOW_UPDATE,
+            )
+        ),
+    )
+
+def handle_window_probe(
+    session: Session,
+    datagram: Datagram,
+) -> None:
+    """Always answer a probe, including when our window is zero."""
+    send_window_update(session)
+
+def handle_window_update(
+    session: Session,
+    datagram: Datagram,
+) -> None:
+    """Apply a window advertisement without acknowledging DATA."""
+    with session.sender.lock:
+        update_window_and_pump(session, datagram.rdt.rwnd)
 # Layer 3: Sessions
 def session_key(session: Session) -> tuple:
     return (session.address, session.session_id)

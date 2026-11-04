@@ -34,8 +34,7 @@ running = threading.Event()
 running.set()
 
 # Buffer configuration
-DATA_BUFFER_SIZE = 32             # Maximum queued incoming DATA datagrams
-
+DATA_BUFFER_SIZE = 2            # Maximum queued incoming DATA datagrams
 # Layer 2 (reliable) state
 send_lock = threading.Lock()      # stop-and-wait: one unACKed DATA at a time
 send_state_lock = threading.Lock()# Protects pending_seq
@@ -179,7 +178,7 @@ def send_reliable(msg_type: int, req_id: int, payload: dict) -> bool:
                     log(f"[RETRANSMIT] seq={seq} | retry={attempt}/{MAX_RETRANSMISSIONS}")
  
                 if ack_event.wait(RETRANSMISSION_TIMEOUT):
-                    send_seq ^= 1   # advance only after the correct ACK
+                    send_seq += 1   # advance only after the correct ACK
                     return True
  
             log(f"[TRANSMISSION FAILED] seq={seq} | retries={MAX_RETRANSMISSIONS}")
@@ -196,7 +195,7 @@ def handle_ack(datagram) -> None:
     ack_num = datagram.rdt.ack_num
 
     with send_state_lock:
-        if pending_seq is not None and ack_num == pending_seq:
+        if pending_seq is not None and ack_num == pending_seq + 1:
             log(f"[ACK ACCEPTED] ack_num={ack_num}")
             update_peer_window(datagram.rdt.rwnd)
             ack_event.set()
@@ -230,38 +229,55 @@ def handle_datagram(datagram) -> None:
 
 def receive_data(datagram) -> None:
     "Accept inbound DATA into the buffer before acknowledging it."
-    global expected_recv_seq
+    # global expected_recv_seq
 
+    # seq = datagram.rdt.seq_num
+
+    # if seq not in (0, 1):
+    #     log(f"[REJECTED DATA] Invalid seq={seq}")
+    #     return
+
+    # # Always ACK, even duplicates, in case previous ACK was lost.
+    # if seq != expected_recv_seq:
+    #     log(f"[DUPLICATE DATA] seq={seq}")
+    #     send_ack(seq)
+    #     return
+
+    # # Only acknowledge a new DATA packet after successfully retaining it.
+    # try:
+    #     incoming_data.put_nowait(datagram)
+    # except queue.Full:
+    #     log(
+    #         f"[RECEIVE BUFFER FULL] seq={seq} | "
+    #         f"capacity={DATA_BUFFER_SIZE}"
+    #     )
+    #     return
+
+    # expected_recv_seq ^= 1
+    # update_peer_window(datagram.rdt.rwnd)
+    # send_ack(seq)
+
+    # log(
+    #     f"[DATA BUFFERED] seq={seq} | "
+    #     f"queued={incoming_data.qsize()}/{DATA_BUFFER_SIZE}"
+    # )
+    global expected_recv_seq
     seq = datagram.rdt.seq_num
 
-    if seq not in (0, 1):
-        log(f"[REJECTED DATA] Invalid seq={seq}")
+    if seq != expected_recv_seq:            # duplicate or out of order
+        log(f"[DUPLICATE/OUT-OF-ORDER] seq={seq} | expected={expected_recv_seq}")
+        send_ack(expected_recv_seq)
         return
 
-    # Always ACK, even duplicates, in case previous ACK was lost.
-    if seq != expected_recv_seq:
-        log(f"[DUPLICATE DATA] seq={seq}")
-        send_ack(seq)
-        return
-
-    # Only acknowledge a new DATA packet after successfully retaining it.
     try:
         incoming_data.put_nowait(datagram)
     except queue.Full:
-        log(
-            f"[RECEIVE BUFFER FULL] seq={seq} | "
-            f"capacity={DATA_BUFFER_SIZE}"
-        )
+        log(f"[RECEIVE BUFFER FULL] seq={seq}")
         return
 
-    expected_recv_seq ^= 1
+    expected_recv_seq += 1
     update_peer_window(datagram.rdt.rwnd)
-    send_ack(seq)
-
-    log(
-        f"[DATA BUFFERED] seq={seq} | "
-        f"queued={incoming_data.qsize()}/{DATA_BUFFER_SIZE}"
-    )
+    send_ack(expected_recv_seq)             # was send_ack(seq)
 
 def update_peer_window(rwnd: int) -> None:
     global peer_rwnd
@@ -274,21 +290,45 @@ def update_peer_window(rwnd: int) -> None:
 
     log(f"[PEER WINDOW] rwnd={rwnd}")
 
+WINDOW_UPDATE_INTERVAL = 0.5
+
 def receiver_loop() -> None:
+    last_window_update = 0.0
+    window_was_full = False
+
     while running.is_set():
         try:
-            datagram = transport_receive()
-        except socket.timeout:
-            continue
+            try:
+                datagram = transport_receive()
+            except socket.timeout:
+                datagram = None
+
+            if datagram is not None:
+                handle_datagram(datagram)
+
+            now = time.monotonic()
+            rwnd = receive_window()
+
+            if rwnd == 0:
+                window_was_full = True
+
+            # Send updates periodically while full, then once when space opens.
+            if established and window_was_full and (
+                rwnd == 0
+                and now - last_window_update >= WINDOW_UPDATE_INTERVAL
+                or rwnd > 0
+            ):
+                send_control(RDTType.WINDOW_UPDATE, quiet=False)
+                last_window_update = now
+
+                if rwnd > 0:
+                    window_was_full = False
+
         except OSError as error:
             if running.is_set():
                 log(f"\n[RECEIVER ERROR] {error}")
                 running.clear()
             break
- 
-        if datagram is not None:          
-            handle_datagram(datagram)
-
 def handler_loop() -> None:
     while running.is_set() or not incoming_data.empty():
         try:
