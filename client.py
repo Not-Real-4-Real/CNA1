@@ -22,7 +22,7 @@ MAX_RETRANSMISSIONS = 5
 RESPONSE_TIMEOUT = RETRANSMISSION_TIMEOUT * (MAX_RETRANSMISSIONS + 3)
 
 HEARTBEAT_INTERVAL = 10.0
-
+PROBE_INTERVAL = 1.0
 FILE_CHUNK_SIZE = 600 
 
 session_id = secrets.token_bytes(16)
@@ -52,7 +52,6 @@ peer_window_lock = threading.Lock()
 peer_window_condition = threading.Condition()
 
 # Layer 2 -> Layer 4 hook: called with every new (non-duplicate) DATA datagram.
-message_handler = None
  
 # Layer 3 (session) state
 established = False
@@ -150,8 +149,9 @@ def send_reliable(msg_type: int, req_id: int, payload: dict) -> bool:
     with send_lock:
         with peer_window_condition:
             while peer_rwnd <= 0:
-                peer_window_condition.wait()
-
+                if not  peer_window_condition.wait(timeout=PROBE_INTERVAL):
+                    print("[WAITING] Peer receive window is full, waiting to ask WINDOW_PROBE then continue")
+                    send_control(RDTType.WINDOW_PROBE)
         seq = send_seq
         packet = encode_datagram(
             RDTHeader(
@@ -224,6 +224,8 @@ def handle_datagram(datagram) -> None:
         handle_ack(datagram)
     elif packet_type == RDTType.DATA:
         receive_data(datagram)
+    elif packet_type == RDTType.WINDOW_UPDATE:
+        update_peer_window(datagram.rdt.rwnd)
     else:
         log(f"[IGNORED] Unexpected RDT type={packet_type}")
 
@@ -658,9 +660,8 @@ def deliver_response(datagram) -> None:
         response_queue.put_nowait(datagram)
     except queue.Full:
         pass  # a response for this request is already queued
- 
 message_handler = deliver_response
- 
+
 def send_request(msg_type: int, payload: dict, timeout: float = RESPONSE_TIMEOUT):
     "Send a request reliably and wait for the response with the same req_id."
 

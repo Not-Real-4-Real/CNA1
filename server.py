@@ -19,6 +19,8 @@ MAX_RWND= 0xFF
 RETRANSMISSION_TIMEOUT = 1.0   # seconds
 MAX_RETRANSMISSIONS = 5
 HEARTBEAT_TIMEOUT = 30.0        # seconds without valid client activity
+DATA_BUFFER_SIZE = 32 #max queu size for incoming DATA per session
+
 message_handler = None
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
@@ -65,8 +67,6 @@ class Session:
 
     queue_lock: threading.Lock = field(default_factory=threading.Lock)
     handler_scheduled: bool = False
-
-DATA_BUFFER_SIZE = 32
 
 running = threading.Event()
 running.set()
