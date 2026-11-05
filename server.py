@@ -354,10 +354,12 @@ def receive_data(session: Session, datagram: Datagram) -> None:
     if should_schedule:
         ready_sessions.put_nowait(session)
 
-    # Advertise the sender's receive window from this DATA header.
-    with session.sender.lock:
-        session.sender.peer_rwnd = max(0, datagram.rdt.rwnd)
-        pump_outbox(session)
+    # Take the peer's receive window from this DATA header, but not from a
+    # duplicate: a retransmission still carries the rwnd of its first send.
+    if not duplicate:
+        with session.sender.lock:
+            session.sender.peer_rwnd = max(0, datagram.rdt.rwnd)
+            pump_outbox(session)
 
     # Selective Repeat ACKs out-of-order packets immediately after buffering.
     send_ack(session, seq)

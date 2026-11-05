@@ -181,16 +181,21 @@ def queue_reliable(msg_type: int, req_id: int, payload: dict):
 
             if has_sequence_space and has_receiver_capacity:
                 seq = send_next_seq
-                packet = encode_datagram(
-                    RDTHeader(
-                        session_id=session_id,
-                        seq_num=seq,
-                        rwnd=receive_window(),
-                        type=RDTType.DATA,
-                    ),
-                    AppHeader(length=0, type=msg_type, req_id=req_id),
-                    payload=payload,
-                )
+                try:
+                    packet = encode_datagram(
+                        RDTHeader(
+                            session_id=session_id,
+                            seq_num=seq,
+                            rwnd=receive_window(),
+                            type=RDTType.DATA,
+                        ),
+                        AppHeader(length=0, type=msg_type, req_id=req_id),
+                        payload=payload,
+                    )
+                except ValueError as error:
+                    # Nothing has been allocated yet, so the window is unchanged.
+                    log(f"[SEND REJECTED] Cannot encode message: {error}")
+                    return None
                 pending = OutstandingPacket(
                     packet=packet,
                     sent_at=time.monotonic(),
@@ -244,25 +249,31 @@ def send_reliable(msg_type: int, req_id: int, payload: dict) -> bool:
 
 
 def send_reliable_batch(msg_type: int, req_id: int, payloads) -> bool:
-    """Send payloads in SR-sized batches, allowing several chunks in flight.
+    """Send payloads through the Selective Repeat window, keeping it full.
 
-    This is used by file upload so chunks do not fall back to stop-and-wait.
-    Every packet in a batch is sent before the client waits for its ACKs.
+    queue_reliable() already blocks while the SR window (or the peer's rwnd)
+    is full, and unblocks as individual ACKs slide the window. So there is no
+    need to wait for a whole batch to be ACKed before sending more: a single
+    lost packet only holds back the window, not every packet behind it.
     """
-    batch = []
+    in_flight = []
     for payload in payloads:
         queued = queue_reliable(msg_type, req_id, payload)
         if queued is None:
             return False
-        batch.append(queued)
+        in_flight.append(queued)
 
-        if len(batch) >= SR_WINDOW_SIZE:
-            results = [wait_reliable(seq, pending) for seq, pending in batch]
-            batch.clear()
-            if not all(results):
-                return False
+        # Fail fast if the channel already gave up on an earlier packet.
+        if any(p.completed.is_set() and not p.success for _, p in in_flight):
+            return False
 
-    results = [wait_reliable(seq, pending) for seq, pending in batch]
+        # Forget packets that are already ACKed; only unresolved ones matter.
+        in_flight = [
+            (seq, p) for seq, p in in_flight
+            if not (p.completed.is_set() and p.success)
+        ]
+
+    results = [wait_reliable(seq, pending) for seq, pending in in_flight]
     return all(results)
 
 
@@ -422,7 +433,11 @@ def receive_data(datagram) -> None:
             )
             return
 
-    update_peer_window(datagram.rdt.rwnd)
+    # A duplicate may be a retransmission whose header still carries the
+    # rwnd from its first transmission, so only fresh packets refresh the peer
+    # window. The ACK sent below carries a current rwnd anyway.
+    if not duplicate:
+        update_peer_window(datagram.rdt.rwnd)
     # ACK duplicates too: the original ACK may have been lost.
     send_ack(seq)
 

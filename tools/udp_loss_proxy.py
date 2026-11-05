@@ -11,8 +11,7 @@ PROXY_PORT = 5001
 SERVER_ADDRESS = ("127.0.0.1", 5000)
 BUFFER_SIZE = 1201
 
-RDT_HEADER_SIZE = struct.calcsize("!16sIIBB")
-APP_HEADER_SIZE = struct.calcsize("!IBIB")
+from udp_protocol import RDT_HEADER_SIZE, APP_HEADER_SIZE
 
 # Choose one:
 # "none"
