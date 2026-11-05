@@ -10,6 +10,36 @@ APP_HEADER_SIZE = struct.calcsize(APP_HEADER_FORMAT)  # 10 bytes
 
 MAX_DATAGRAM_SIZE = 1200
 
+# Selective Repeat parameters. Keep the sender/receiver windows smaller than
+# half the sequence-number space so modular sequence comparisons are unambiguous.
+SEQ_MODULUS = 1 << 32
+SR_WINDOW_SIZE = 8
+
+
+def seq_add(seq_num: int, amount: int = 1) -> int:
+    """Advance a 32-bit sequence number, including wraparound."""
+    return (seq_num + amount) % SEQ_MODULUS
+
+
+def seq_distance(seq_num: int, base: int) -> int:
+    """Forward modular distance from base to seq_num."""
+    return (seq_num - base) % SEQ_MODULUS
+
+
+def seq_in_window(seq_num: int, base: int, window_size: int = SR_WINDOW_SIZE) -> bool:
+    """Return whether seq_num is inside [base, base + window_size)."""
+    return seq_distance(seq_num, base) < window_size
+
+
+def seq_is_recent_duplicate(
+    seq_num: int,
+    base: int,
+    window_size: int = SR_WINDOW_SIZE,
+) -> bool:
+    """Return whether seq_num is among the most recently accepted packets."""
+    behind = seq_distance(base, seq_num)
+    return 0 < behind <= window_size
+
 MAX_PAYLOAD_SIZE = (
     MAX_DATAGRAM_SIZE
     - RDT_HEADER_SIZE
@@ -24,6 +54,8 @@ class RDTType:
     CLOSE = 5
     CLOSE_ACK = 6
     HEARTBEAT = 7
+    WINDOW_UPDATE = 8
+    WINDOW_PROBE = 9
 
 class MessageType:
     HELLO = 1

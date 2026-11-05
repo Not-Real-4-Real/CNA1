@@ -22,6 +22,7 @@ MAX_RETRANSMISSIONS = 5
 RESPONSE_TIMEOUT = RETRANSMISSION_TIMEOUT * (MAX_RETRANSMISSIONS + 3)
 
 HEARTBEAT_INTERVAL = 10.0
+PERSIST_INTERVAL = 1.0
 
 FILE_CHUNK_SIZE = 600 
 
@@ -36,21 +37,23 @@ running.set()
 # Buffer configuration
 DATA_BUFFER_SIZE = 32             # Maximum queued incoming DATA datagrams
 
-# Layer 2 (reliable) state
-send_lock = threading.Lock()      # stop-and-wait: one unACKed DATA at a time
-send_state_lock = threading.Lock()# Protects pending_seq
-send_seq = 0                      # seq of the next DATA we send
-pending_seq = None                # seq we are currently waiting an ACK for
-ack_event = threading.Event()     # set by receiver when the pending DATA is ACKed
-expected_recv_seq = 0             # seq we expect from the server next
+# Layer 2 (reliable) state: Selective Repeat sliding windows.
+# send_base is the oldest sequence number not cumulatively passed by the window;
+# send_next_seq is the next sequence number to allocate.
+send_state_lock = threading.RLock()
+send_condition = threading.Condition(send_state_lock)
+send_base = 0
+send_next_seq = 0
+outstanding_packets = {}       # seq_num -> OutstandingPacket
+acked_sequences = set()       # ACKed out of order, waiting for send_base to advance
+peer_rwnd = 0                 # most recently advertised receiver window
+last_window_probe = 0.0
 
-# Incoming DATA buffer: consumed by the future handler loop
+# Incoming DATA buffer: application handler consumes this queue in order.
 incoming_data = queue.Queue(maxsize=DATA_BUFFER_SIZE)
-
-# Server rwnd for flow control
-peer_rwnd = 0
-peer_window_lock = threading.Lock()
-peer_window_condition = threading.Condition()
+receive_state_lock = threading.Lock()
+receive_base = 0
+receive_buffer = {}            # seq_num -> Datagram (out-of-order packets)
 
 # Layer 2 -> Layer 4 hook: called with every new (non-duplicate) DATA datagram.
 message_handler = None
@@ -82,6 +85,15 @@ class FileTransfer:
     chunks: list[bytes] = field(default_factory=list)
     next_chunk_index: int = 0
     received_size: int = 0
+
+@dataclass
+class OutstandingPacket:
+    packet: bytes
+    sent_at: float
+    retransmissions: int = 0
+    completed: threading.Event = field(default_factory=threading.Event)
+    success: bool = False
+    error: str | None = None
 
 incoming_transfers: dict[str, FileTransfer] = {}
 incoming_transfers_lock = threading.Lock()
@@ -116,9 +128,9 @@ def transport_receive():
  
     return datagram
 
-# Layer 2: Reliable delivery (stop-and-wait, alternating 0/1 sequence)
+# Layer 2: Reliable delivery (Selective Repeat sliding window)
 def send_control(packet_type: int, quiet: bool = False) -> None:
-    "Send a header-only packet (OPEN / CLOSE / HEARTBEAT)."
+    "Send a header-only RDT packet (OPEN / CLOSE / HEARTBEAT / window control)."
     transport_send(
         encode_datagram(
             RDTHeader(
@@ -130,6 +142,7 @@ def send_control(packet_type: int, quiet: bool = False) -> None:
     )
     if not quiet:
         log(f"[SENT CONTROL] type={packet_type} | session={session_id.hex()[:8]}")
+
 
 def send_ack(ack_num: int) -> None:
     rwnd = receive_window()
@@ -143,65 +156,211 @@ def send_ack(ack_num: int) -> None:
             )
         )
     )
-    log(f"[ACK SENT] ack_num={ack_num}| rwnd={rwnd}")
+    log(f"[ACK SENT] ack_num={ack_num} | rwnd={rwnd}")
+
+
+def send_window_update() -> None:
+    """Advertise newly freed receive-buffer capacity to the server."""
+    send_control(RDTType.WINDOW_UPDATE, quiet=True)
+
+
+def queue_reliable(msg_type: int, req_id: int, payload: dict):
+    """Allocate a sequence number and enqueue one DATA packet for transmission.
+
+    Returns (seq_num, OutstandingPacket), or None if the sender cannot obtain
+    window capacity before RESPONSE_TIMEOUT expires.
+    """
+    global send_next_seq, last_window_probe
+
+    deadline = time.monotonic() + RESPONSE_TIMEOUT
+    with send_condition:
+        while running.is_set():
+            window_span = seq_distance(send_next_seq, send_base)
+            has_sequence_space = window_span < SR_WINDOW_SIZE
+            has_receiver_capacity = len(outstanding_packets) < peer_rwnd
+
+            if has_sequence_space and has_receiver_capacity:
+                seq = send_next_seq
+                packet = encode_datagram(
+                    RDTHeader(
+                        session_id=session_id,
+                        seq_num=seq,
+                        rwnd=receive_window(),
+                        type=RDTType.DATA,
+                    ),
+                    AppHeader(length=0, type=msg_type, req_id=req_id),
+                    payload=payload,
+                )
+                pending = OutstandingPacket(
+                    packet=packet,
+                    sent_at=time.monotonic(),
+                )
+                outstanding_packets[seq] = pending
+                send_next_seq = seq_add(send_next_seq)
+                transport_send(packet)
+                log(
+                    f"[DATA SENT] seq={seq} | req_id={req_id} "
+                    f"| in_flight={len(outstanding_packets)}/{SR_WINDOW_SIZE}"
+                )
+                return seq, pending
+
+            now = time.monotonic()
+            if peer_rwnd <= 0 and now - last_window_probe >= PERSIST_INTERVAL:
+                last_window_probe = now
+                try:
+                    send_control(RDTType.WINDOW_PROBE, quiet=True)
+                    log("[WINDOW PROBE] receiver advertised rwnd=0")
+                except OSError as error:
+                    log(f"[WINDOW PROBE ERROR] {error}")
+
+            remaining = deadline - now
+            if remaining <= 0:
+                log("[SEND BLOCKED] No sender-window or receiver-window capacity")
+                return None
+            send_condition.wait(timeout=min(remaining, 0.2))
+
+    return None
+
+
+def wait_reliable(seq: int, pending: OutstandingPacket) -> bool:
+    """Wait for the ACK (or terminal failure) of one queued DATA packet."""
+    wait_time = RETRANSMISSION_TIMEOUT * (MAX_RETRANSMISSIONS + 2) + 0.5
+    if not pending.completed.wait(wait_time):
+        log(f"[ACK TIMEOUT] seq={seq}")
+        return False
+    if not pending.success:
+        log(f"[TRANSMISSION FAILED] seq={seq} | reason={pending.error}")
+        return False
+    return True
+
 
 def send_reliable(msg_type: int, req_id: int, payload: dict) -> bool:
-    global send_seq, pending_seq
- 
-    with send_lock:
-        with peer_window_condition:
-            while peer_rwnd <= 0:
-                peer_window_condition.wait()
+    """Send one application message reliably and wait for its packet ACK."""
+    queued = queue_reliable(msg_type, req_id, payload)
+    if queued is None:
+        return False
+    seq, pending = queued
+    return wait_reliable(seq, pending)
 
-        seq = send_seq
-        packet = encode_datagram(
-            RDTHeader(
-                session_id=session_id, 
-                seq_num=seq, 
-                rwnd=receive_window(),
-                type=RDTType.DATA
-            ),
-            AppHeader(length=0, type=msg_type, req_id=req_id),
-            payload=payload,
-        )
- 
-        ack_event.clear()
 
-        with send_state_lock:
-            pending_seq = seq
- 
-        try:
-            for attempt in range(MAX_RETRANSMISSIONS + 1):
-                transport_send(packet)
-                if attempt == 0:
-                    log(f"[DATA SENT] seq={seq} | req_id={req_id} | payload={payload}")
-                else:
-                    log(f"[RETRANSMIT] seq={seq} | retry={attempt}/{MAX_RETRANSMISSIONS}")
- 
-                if ack_event.wait(RETRANSMISSION_TIMEOUT):
-                    send_seq ^= 1   # advance only after the correct ACK
-                    return True
- 
-            log(f"[TRANSMISSION FAILED] seq={seq} | retries={MAX_RETRANSMISSIONS}")
+def send_reliable_batch(msg_type: int, req_id: int, payloads) -> bool:
+    """Send payloads in SR-sized batches, allowing several chunks in flight.
+
+    This is used by file upload so chunks do not fall back to stop-and-wait.
+    Every packet in a batch is sent before the client waits for its ACKs.
+    """
+    batch = []
+    for payload in payloads:
+        queued = queue_reliable(msg_type, req_id, payload)
+        if queued is None:
             return False
-        finally:
-            with send_state_lock:
-                if pending_seq == seq:
-                    pending_seq = None
+        batch.append(queued)
+
+        if len(batch) >= SR_WINDOW_SIZE:
+            results = [wait_reliable(seq, pending) for seq, pending in batch]
+            batch.clear()
+            if not all(results):
+                return False
+
+    results = [wait_reliable(seq, pending) for seq, pending in batch]
+    return all(results)
+
 
 def receive_window() -> int:
-    return max(0, DATA_BUFFER_SIZE - incoming_data.qsize())
+    with receive_state_lock:
+        occupied = incoming_data.qsize() + len(receive_buffer)
+        return max(0, DATA_BUFFER_SIZE - occupied)
+
 
 def handle_ack(datagram) -> None:
+    """Accept a packet-level ACK and slide the sender window."""
+    global send_base, peer_rwnd
     ack_num = datagram.rdt.ack_num
 
-    with send_state_lock:
-        if pending_seq is not None and ack_num == pending_seq:
-            log(f"[ACK ACCEPTED] ack_num={ack_num}")
-            update_peer_window(datagram.rdt.rwnd)
-            ack_event.set()
+    with send_condition:
+        # The advertised window is useful even when this ACK is a duplicate.
+        peer_rwnd = datagram.rdt.rwnd
+        pending = outstanding_packets.pop(ack_num, None)
+
+        if pending is None:
+            log(f"[IGNORED ACK] ack_num={ack_num} | no matching outstanding packet")
         else:
-            log(f"[IGNORED ACK] ack_num={ack_num}")
+            pending.success = True
+            pending.completed.set()
+            acked_sequences.add(ack_num)
+            log(
+                f"[ACK ACCEPTED] ack_num={ack_num} "
+                f"| retries={pending.retransmissions} | rwnd={peer_rwnd}"
+            )
+
+            while send_base in acked_sequences:
+                acked_sequences.remove(send_base)
+                send_base = seq_add(send_base)
+
+        send_condition.notify_all()
+
+
+def check_retransmissions() -> None:
+    """Retransmit each expired unACKed DATA packet independently."""
+    failed = []
+    now = time.monotonic()
+
+    with send_condition:
+        for seq, pending in list(outstanding_packets.items()):
+            if now - pending.sent_at < RETRANSMISSION_TIMEOUT:
+                continue
+
+            if pending.retransmissions >= MAX_RETRANSMISSIONS:
+                pending.success = False
+                pending.error = "maximum retransmissions exceeded"
+                pending.completed.set()
+                outstanding_packets.pop(seq, None)
+                failed.append(seq)
+                continue
+
+            try:
+                transport_send(pending.packet)
+            except OSError as error:
+                pending.success = False
+                pending.error = str(error)
+                pending.completed.set()
+                outstanding_packets.pop(seq, None)
+                failed.append(seq)
+                continue
+
+            pending.retransmissions += 1
+            pending.sent_at = now
+            log(
+                f"[RETRANSMIT] seq={seq} "
+                f"| retry={pending.retransmissions}/{MAX_RETRANSMISSIONS}"
+            )
+
+        if failed:
+            log(f"[RELIABLE CHANNEL FAILED] sequence(s)={failed}; session must reconnect")
+            send_condition.notify_all()
+
+    if failed:
+        # Continuing after a missing sequence would leave the peer's receive
+        # window blocked, so fail the session rather than silently skipping it.
+        global established
+        established = False
+        running.clear()
+
+
+def _drain_receive_buffer_locked() -> None:
+    """Move contiguous buffered packets to the application queue in order.
+
+    Caller must hold receive_state_lock.
+    """
+    global receive_base
+    while receive_base in receive_buffer:
+        try:
+            incoming_data.put_nowait(receive_buffer[receive_base])
+        except queue.Full:
+            break
+        del receive_buffer[receive_base]
+        receive_base = seq_add(receive_base)
+
 
 def handle_data(datagram) -> None:
     "Process an already-accepted DATA datagram at the application layer."
@@ -214,9 +373,10 @@ def handle_data(datagram) -> None:
     else:
         log("[ERROR] message_handler is None")
 
+
 def handle_datagram(datagram) -> None:
     packet_type = datagram.rdt.type
- 
+
     if packet_type == RDTType.OPEN_ACK:
         handle_open_ack(datagram)
     elif packet_type == RDTType.CLOSE_ACK:
@@ -225,69 +385,82 @@ def handle_datagram(datagram) -> None:
         handle_ack(datagram)
     elif packet_type == RDTType.DATA:
         receive_data(datagram)
+    elif packet_type == RDTType.WINDOW_UPDATE:
+        update_peer_window(datagram.rdt.rwnd)
+    elif packet_type == RDTType.WINDOW_PROBE:
+        send_window_update()
     else:
         log(f"[IGNORED] Unexpected RDT type={packet_type}")
 
+
 def receive_data(datagram) -> None:
-    "Accept inbound DATA into the buffer before acknowledging it."
-    global expected_recv_seq
-
+    """Selective Repeat receiver: buffer in-window packets and ACK each one."""
     seq = datagram.rdt.seq_num
+    accepted = False
+    duplicate = False
 
-    if seq not in (0, 1):
-        log(f"[REJECTED DATA] Invalid seq={seq}")
-        return
+    with receive_state_lock:
+        if seq in receive_buffer:
+            duplicate = True
+        elif seq_in_window(seq, receive_base, SR_WINDOW_SIZE):
+            occupied = incoming_data.qsize() + len(receive_buffer)
+            if occupied >= DATA_BUFFER_SIZE:
+                log(
+                    f"[RECEIVE BUFFER FULL] seq={seq} "
+                    f"| capacity={DATA_BUFFER_SIZE}"
+                )
+                return
+            receive_buffer[seq] = datagram
+            accepted = True
+            _drain_receive_buffer_locked()
+        elif seq_is_recent_duplicate(seq, receive_base, SR_WINDOW_SIZE):
+            duplicate = True
+        else:
+            log(
+                f"[REJECTED DATA] seq={seq} outside receive window "
+                f"(base={receive_base}, size={SR_WINDOW_SIZE})"
+            )
+            return
 
-    # Always ACK, even duplicates, in case previous ACK was lost.
-    if seq != expected_recv_seq:
-        log(f"[DUPLICATE DATA] seq={seq}")
-        send_ack(seq)
-        return
-
-    # Only acknowledge a new DATA packet after successfully retaining it.
-    try:
-        incoming_data.put_nowait(datagram)
-    except queue.Full:
-        log(
-            f"[RECEIVE BUFFER FULL] seq={seq} | "
-            f"capacity={DATA_BUFFER_SIZE}"
-        )
-        return
-
-    expected_recv_seq ^= 1
     update_peer_window(datagram.rdt.rwnd)
+    # ACK duplicates too: the original ACK may have been lost.
     send_ack(seq)
 
-    log(
-        f"[DATA BUFFERED] seq={seq} | "
-        f"queued={incoming_data.qsize()}/{DATA_BUFFER_SIZE}"
-    )
+    if duplicate:
+        log(f"[DUPLICATE DATA] seq={seq} | ACK resent")
+    elif accepted:
+        log(
+            f"[DATA BUFFERED] seq={seq} | "
+            f"queued={incoming_data.qsize()}/{DATA_BUFFER_SIZE} "
+            f"| recv_base={receive_base}"
+        )
+
 
 def update_peer_window(rwnd: int) -> None:
     global peer_rwnd
-
-    with peer_window_condition:
-        peer_rwnd = rwnd
-
-        if peer_rwnd > 0:
-            peer_window_condition.notify_all()
-
+    with send_condition:
+        peer_rwnd = max(0, rwnd)
+        send_condition.notify_all()
     log(f"[PEER WINDOW] rwnd={rwnd}")
+
 
 def receiver_loop() -> None:
     while running.is_set():
         try:
             datagram = transport_receive()
         except socket.timeout:
+            check_retransmissions()
             continue
         except OSError as error:
             if running.is_set():
                 log(f"\n[RECEIVER ERROR] {error}")
                 running.clear()
             break
- 
-        if datagram is not None:          
+
+        if datagram is not None:
             handle_datagram(datagram)
+        check_retransmissions()
+
 
 def handler_loop() -> None:
     while running.is_set() or not incoming_data.empty():
@@ -302,11 +475,17 @@ def handler_loop() -> None:
             log(f"[HANDLER ERROR] {error}")
         finally:
             incoming_data.task_done()
- 
-receiver_thread = threading.Thread(target=receiver_loop, daemon=True)
-handler_thread = threading.Thread(target=handler_loop,daemon=True)
+            with receive_state_lock:
+                _drain_receive_buffer_locked()
+            try:
+                send_window_update()
+            except OSError as error:
+                log(f"[WINDOW UPDATE ERROR] {error}")
 
-# Layer 3: Session (OPEN / CLOSE handshakes, heartbeat)
+
+receiver_thread = threading.Thread(target=receiver_loop, name="udp-receiver", daemon=True)
+handler_thread = threading.Thread(target=handler_loop, name="udp-handler", daemon=True)
+
 def control_handshake(packet_type: int, ack_event_: threading.Event, label: str) -> bool:
     "Send a control packet, retransmitting until its ACK event is set."
     ack_event_.clear()
@@ -808,36 +987,30 @@ def offer_file(file_path: str):
         f"| chunks={total_chunks}"
     )
 
-    for chunk_index, offset in enumerate(range(0, len(file_bytes), FILE_CHUNK_SIZE)):
-        # Inside the FILE_DATA chunk loop, after send_reliable succeeds:
-        # time.sleep(0.5)
-        
-        chunk = file_bytes[offset:offset + FILE_CHUNK_SIZE]
+    def iter_chunk_payloads():
+        for chunk_index, offset in enumerate(range(0, len(file_bytes), FILE_CHUNK_SIZE)):
+            chunk = file_bytes[offset:offset + FILE_CHUNK_SIZE]
+            encoded_chunk = base64.b64encode(chunk).decode("ascii")
 
-        encoded_chunk = base64.b64encode(chunk).decode("ascii")
-
-        payload = {
-            "transfer_id": transfer_id,
-            "chunk_index": chunk_index,
-            "data": encoded_chunk,
-        }
-
-        log(
-            f"[FILE CHUNK SENDING] "
-            f"{chunk_index + 1}/{total_chunks} "
-            f"| raw_bytes={len(chunk)}"
-        )
-
-        if not send_reliable(
-            MessageType.FILE_DATA,
-            EVENT_REQ_ID,
-            payload,
-        ):
             log(
-                f"[FILE TRANSFER FAILED] "
-                f"Could not deliver chunk {chunk_index}"
+                f"[FILE CHUNK SENDING] "
+                f"{chunk_index + 1}/{total_chunks} "
+                f"| raw_bytes={len(chunk)}"
             )
-            return None
+
+            yield {
+                "transfer_id": transfer_id,
+                "chunk_index": chunk_index,
+                "data": encoded_chunk,
+            }
+
+    if not send_reliable_batch(
+        MessageType.FILE_DATA,
+        EVENT_REQ_ID,
+        iter_chunk_payloads(),
+    ):
+        log("[FILE TRANSFER FAILED] Could not deliver all chunks")
+        return None
 
     # Step 4: Tell the server that all chunks have been sent.
     response = send_request(
