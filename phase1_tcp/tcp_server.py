@@ -1,8 +1,8 @@
 import socket
 import threading
 
-from client_connection import ClientConnection
-from protocol import MessageType, send_frame, recv_frame
+from CNA1.phase1_tcp.client_connection import ClientConnection
+from CNA1.phase1_tcp.protocol import MessageType, send_frame, recv_frame
 
 HOST = "127.0.0.1"
 PORT = 5000

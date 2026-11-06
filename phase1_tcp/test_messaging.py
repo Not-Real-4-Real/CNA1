@@ -4,7 +4,7 @@ import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 
-from protocol import MessageType, send_frame, recv_frame
+from CNA1.phase1_tcp.protocol import MessageType, send_frame, recv_frame
 
 
 HOST = "127.0.0.1"
