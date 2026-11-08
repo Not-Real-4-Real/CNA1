@@ -3,6 +3,8 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+.venv/
+
 # Thư mục lưu file tải lên/nhận về sinh ra trong lúc chạy thử nghiệm
 received_files/
 client_received_files/

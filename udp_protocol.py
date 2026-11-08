@@ -1,6 +1,7 @@
 import json
 import struct
 from dataclasses import dataclass
+from security import encrypt_payload, decrypt_payload
 
 RDT_HEADER_FORMAT = "!16sIIBBB"
 RDT_HEADER_SIZE = struct.calcsize(RDT_HEADER_FORMAT)  # 27 bytes
@@ -231,6 +232,8 @@ def encode_datagram(
             ensure_ascii=False,
             separators=(",", ":"),
         ).encode("utf-8")
+        
+        payload_bytes = encrypt_payload(payload_bytes)
 
         if len(payload_bytes) > MAX_PAYLOAD_SIZE:
             raise ValueError(
@@ -241,7 +244,7 @@ def encode_datagram(
             length=len(payload_bytes),
             type=app.type,
             req_id=app.req_id,
-            flags=app.flags,
+            flags=app.flags | FLAG_ENCRYPTED
         )
 
         datagram = (
@@ -303,11 +306,15 @@ def decode_datagram(data: bytes) -> Datagram:
             f"Payload length mismatch: expected {app.length} bytes, "
             f"got {len(payload_bytes)}"
         )
+        
+    if not app.flags & FLAG_ENCRYPTED:
+        raise ValueError("Payload is not encrypted")
 
     try:
-        payload = json.loads(payload_bytes.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ValueError("Invalid UTF-8 JSON payload") from error
+        decrypted_bytes = decrypt_payload(payload_bytes)
+        payload = json.loads(decrypted_bytes.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("Invalid or undecrypted payload") from error
 
     if not isinstance(payload, dict):
         raise ValueError(
